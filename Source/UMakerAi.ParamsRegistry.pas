@@ -119,7 +119,7 @@ begin
   If ExpandVariables = True then  //Debe expandir las variable con las de entorno
   Begin
     // Expansión de Variables de Entorno
-    for I := 0 to Params.Count - 1 do
+    for I := Params.Count - 1 downto 0 do
     begin
       if (Params.ValueFromIndex[I] <> '') and (Params.ValueFromIndex[I].StartsWith('@')) then
       begin
