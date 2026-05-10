@@ -261,7 +261,7 @@ procedure Register;
 
 implementation
 
-{$I uMakerAi.Version.inc}
+{$I ..\Core\uMakerAi.Version.inc}
 {$R ..\Resources\uMakerAiResources.res}
 
 procedure Register;
