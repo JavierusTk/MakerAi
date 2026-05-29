@@ -173,6 +173,7 @@ type
     procedure ParseDeltaContentArray(AContentArr: TJSonArray; jObj: TJSonObject); Override;
 
     function InternalRunNativePDFDescription(aMediaFile: TAiMediaFile; ResMsg, AskMsg: TAiChatMessage): String; Override;
+    function InternalRunNativeTranscription(aMediaFile: TAiMediaFile; ResMsg, AskMsg: TAiChatMessage): String; Override;
     function InternalRunCompletions(ResMsg, AskMsg: TAiChatMessage): String; Override;
 
     // function InternalRunOcr(aMediaFile: TAiMediaFile): String;
@@ -286,7 +287,7 @@ Begin
   Params.Clear;
   Params.Add('ApiKey=@MISTRAL_API_KEY');
   Params.Add('Model=mistral-small-latest');
-  Params.Add('MaxTokens=4096');
+  Params.Add('Max_Tokens=4096');
   Params.Add('URL=https://api.mistral.ai/v1/');
 End;
 
@@ -431,35 +432,34 @@ function TAiMistralChat.UploadFile(aMediaFile: TAiMediaFile): String;
 var
   LBody: TMultipartFormData;
   LTempStream: TMemoryStream;
+  LResponseStream: TMemoryStream;
   LResponse: IHTTPResponse;
   LUrl: string;
   LResponseObj: TJSONObject;
-  LHeaders: TNetHeaders; // A?adido
+  LHeaders: TNetHeaders;
 begin
   Result := '';
   if not Assigned(aMediaFile) or (aMediaFile.Content.Size = 0) then
     raise Exception.Create('Se necesita un TAiMediaFile con contenido para subir.');
 
-  LUrl := Url + 'files'; // URL correcta
+  LUrl := Url + 'files';
   LBody := TMultipartFormData.Create;
   LTempStream := TMemoryStream.Create;
+  LResponseStream := TMemoryStream.Create;
   try
     aMediaFile.Content.Position := 0;
     LTempStream.LoadFromStream(aMediaFile.Content);
     LTempStream.Position := 0;
 
-    // Se debe especificar el prop?sito, para OCR es 'ocr'
     LBody.AddField('purpose', 'ocr');
 
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 36}
     LBody.AddStream('file', LTempStream, False, aMediaFile.Filename, aMediaFile.MimeType);
 {$ELSE}
     LBody.AddStream('file', LTempStream, aMediaFile.Filename, aMediaFile.MimeType);
 {$ENDIF}
-    LHeaders := [TNetHeader.Create('Authorization', 'Bearer ' + ApiKey)]; // A?adir el Header de autorizaci?n
+    LHeaders := [TNetHeader.Create('Authorization', 'Bearer ' + ApiKey)];
 
-    Var
-    LResponseStream := TMemoryStream.Create;
     LResponse := FClient.Post(LUrl, LBody, LResponseStream, LHeaders);
 
     if LResponse.StatusCode = 200 then
@@ -467,7 +467,6 @@ begin
       LResponseObj := TJSONObject.ParseJSONValue(LResponse.ContentAsString) as TJSONObject;
       try
         Result := LResponseObj.GetValue<string>('id');
-        // Guardamos el ID en el objeto MediaFile para uso futuro
         aMediaFile.IDFile := Result;
       finally
         LResponseObj.Free;
@@ -481,6 +480,7 @@ begin
   finally
     LBody.Free;
     LTempStream.Free;
+    LResponseStream.Free;
   end;
 end;
 
@@ -553,12 +553,10 @@ end;
 
 function TAiMistralChat.ExtractToolCallFromJson(jChoices: TJSonArray): TAiToolsFunctions;
 Var
-  jObj, Msg, jFunc, Arg: TJSONObject;
+  jObj, Msg, jFunc: TJSONObject;
   JVal, JVal1, jValToolCall: TJSonValue;
   Fun: TAiToolsFunction;
   JToolCalls: TJSonArray;
-  Nom, Valor: String;
-  I: integer;
 begin
   Result := TAiToolsFunctions.Create;
 
@@ -1326,6 +1324,96 @@ begin
 
   finally
     sb.Free;
+  end;
+end;
+
+function TAiMistralChat.InternalRunNativeTranscription(aMediaFile: TAiMediaFile; ResMsg, AskMsg: TAiChatMessage): String;
+var
+  Body: TMultipartFormData;
+  Client: TNetHTTPClient;
+  Headers: TNetHeaders;
+  sUrl: String;
+  Res: IHTTPResponse;
+  LResponseStream: TMemoryStream;
+  LTempStream: TMemoryStream;
+  LResponseObj: TJSonObject;
+  Granularities: TStringList;
+  I: Integer;
+  LModel: String;
+begin
+  Result := '';
+  if not Assigned(aMediaFile) or (aMediaFile.Content.Size = 0) then
+    raise Exception.Create('Se necesita un archivo de audio con contenido para la transcripci?n.');
+
+  sUrl := Url + 'audio/transcriptions';
+  LModel := TAiChatFactory.Instance.GetBaseModel(GetDriverName, Model);
+
+  Client := TNetHTTPClient.Create(Nil);
+{$IF CompilerVersion >= 35}
+  Client.SynchronizeEvents := False;
+{$ENDIF}
+  LResponseStream := TMemoryStream.Create;
+  Body := TMultipartFormData.Create;
+  Granularities := TStringList.Create;
+  LTempStream := TMemoryStream.Create;
+  try
+    Headers := [TNetHeader.Create('Authorization', 'Bearer ' + ApiKey)];
+
+    aMediaFile.Content.Position := 0;
+    LTempStream.LoadFromStream(aMediaFile.Content);
+    LTempStream.Position := 0;
+
+{$IF CompilerVersion >= 36}
+    Body.AddStream('file', LTempStream, False, aMediaFile.FileName, aMediaFile.MimeType);
+{$ELSE}
+    Body.AddStream('file', LTempStream, aMediaFile.FileName, aMediaFile.MimeType);
+{$ENDIF}
+    Body.AddField('model', LModel);
+
+    if not AskMsg.Prompt.IsEmpty then
+      Body.AddField('prompt', AskMsg.Prompt);
+
+    if not TranscriptionParams.ResponseFormat.IsEmpty then
+      Body.AddField('response_format', TranscriptionParams.ResponseFormat)
+    else
+      Body.AddField('response_format', 'json');
+
+    if not TranscriptionParams.Language.IsEmpty then
+      Body.AddField('language', TranscriptionParams.Language);
+
+    if Self.Temperature > 0 then
+      Body.AddField('temperature', FormatFloat('0.0', Self.Temperature));
+
+    if not TranscriptionParams.TimestampGranularities.IsEmpty then
+    begin
+      Granularities.CommaText := TranscriptionParams.TimestampGranularities;
+      for I := 0 to Granularities.Count - 1 do
+        Body.AddField('timestamp_granularities[]', Trim(Granularities[I]));
+    end;
+
+    Res := Client.Post(sUrl, Body, LResponseStream, Headers);
+
+    if Res.StatusCode = 200 then
+    begin
+      LResponseObj := TJSonObject.ParseJSONValue(Res.ContentAsString) as TJSonObject;
+      if not Assigned(LResponseObj) then
+        LResponseObj := TJSonObject.Create(TJSonPair.Create('text', Res.ContentAsString));
+      try
+        ParseJsonTranscript(LResponseObj, ResMsg, aMediaFile);
+      finally
+        LResponseObj.Free;
+      end;
+      Result := ResMsg.Prompt;
+    end
+    else
+      raise Exception.CreateFmt('Error en la transcripci?n: %d, %s', [Res.StatusCode, Res.ContentAsString]);
+
+  finally
+    Body.Free;
+    Client.Free;
+    LResponseStream.Free;
+    LTempStream.Free;
+    Granularities.Free;
   end;
 end;
 

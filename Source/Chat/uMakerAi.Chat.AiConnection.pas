@@ -41,7 +41,7 @@ uses
   System.Net.URLClient, System.Net.HttpClient, System.Net.HttpClientComponent,
   System.JSON, Rest.JSON,
   uMakerAi.ParamsRegistry, uMakerAi.Tools.Functions, uMakerAi.Core, uMakerAi.Chat,
-  uMakerAi.Chat.Initializations, uMakerAi.Tools.Shell, uMakerAi.Tools.TextEditor, uMakerAi.Tools.ComputerUse, uMakerAi.Chat.Tools, uMakerAi.Chat.Messages;
+  uMakerAi.Tools.Shell, uMakerAi.Tools.TextEditor, uMakerAi.Tools.ComputerUse, uMakerAi.Chat.Tools, uMakerAi.Chat.Messages;
 
 type
   TOnChatModelChangeEvent = procedure(Sender: TObject; const OldChat, NewChat: TAiChat) of object;
@@ -183,6 +183,8 @@ type
     function GetDriversNames: TStringList; virtual;
     function GetAvailableDrivers: TArray<string>;
     function GetModels: TStringList; overload; virtual;
+    class function AvailableDrivers: TArray<string>; static;
+    class function DriverNames: TStringList; static;
     function IsDriverAvailable(const DriverName: string): Boolean;
     procedure ResetParamsToDefaults;
 
@@ -230,7 +232,6 @@ type
     property OnProcessResponse: TAiChatOnProcessResponseEvent read FOnProcessResponse write SetOnProcessResponse;
     Property Version: String Read FVersion;
     property ChatMode: TAiChatMode read FChatMode write SetChatMode default cmConversation;
-    property ChatTools: TAiChatTools read FChatTools;
     property OnStateChange: TAiStateChangeEvent read FOnStateChange write FOnStateChange;
     property SanitizerActive: Boolean read FSanitizerActive write SetSanitizerActive default False;
     property OnSanitize: TAiSanitizeEvent read FOnSanitize write SetOnSanitize;
@@ -296,8 +297,7 @@ end;
 
 destructor TAiChatConnection.Destroy;
 begin
-  if Assigned(FChat) then
-    FChat.Free;
+  FreeAndNil(FChat);  // nil before freeing FSystemPrompt/FMemory/FParams (OnChange=ParamsChanged checks FChat)
 
   FChatTools.Free;
   FSystemPrompt.Free;
@@ -647,7 +647,8 @@ begin
                 LProp.SetValue(LTarget, LIntVal);
 
             tkFloat:
-              if TryStrToFloat(ParamValue, LFloatVal) then
+              if TryStrToFloat(ParamValue, LFloatVal, TFormatSettings.Invariant) or
+                 TryStrToFloat(ParamValue, LFloatVal) then
                 LProp.SetValue(LTarget, LFloatVal);
 
             tkString, tkUString, tkWideString:
@@ -880,6 +881,20 @@ begin
   Result := TAiChatFactory.Instance.GetRegisteredDrivers;
 end;
 
+class function TAiChatConnection.AvailableDrivers: TArray<string>;
+begin
+  Result := TAiChatFactory.Instance.GetRegisteredDrivers;
+end;
+
+class function TAiChatConnection.DriverNames: TStringList;
+var
+  D: string;
+begin
+  Result := TStringList.Create;
+  for D in TAiChatFactory.Instance.GetRegisteredDrivers do
+    Result.Add(D);
+end;
+
 function TAiChatConnection.GetBusy: Boolean;
 begin
   if Assigned(FChat) then
@@ -984,14 +999,15 @@ end;
 
 procedure TAiChatConnection.OnInternalReceiveDataEnd(const Sender: TObject; aMsg: TAiChatMessage; aResponse: TJSonObject; aRole, aText: String);
 begin
-
-  Prompt_tokens := Prompt_tokens + aMsg.Prompt_tokens;
-  Completion_tokens := Completion_tokens + aMsg.Completion_tokens;
-  Total_tokens := Total_tokens + aMsg.Total_tokens;
+  if Assigned(aMsg) then
+  begin
+    Prompt_tokens := Prompt_tokens + aMsg.Prompt_tokens;
+    Completion_tokens := Completion_tokens + aMsg.Completion_tokens;
+    Total_tokens := Total_tokens + aMsg.Total_tokens;
+  end;
 
   If Assigned(FOnReceiveDataEnd) then
     FOnReceiveDataEnd(Sender, aMsg, aResponse, aRole, aText);
-
 end;
 
 procedure TAiChatConnection.RemoveFromMemory(Key: String);

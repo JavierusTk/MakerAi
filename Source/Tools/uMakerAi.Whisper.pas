@@ -52,7 +52,8 @@ uses
 {$IF CompilerVersion < 35}
   uJSONHelper,
 {$ENDIF}
-  uMakerAi.Core, uMakerAi.Chat.Tools, uMakerAi.Chat.Messages;
+  uMakerAi.Core, uMakerAi.Chat.Tools, uMakerAi.Chat.Messages,
+  uMakerAi.Utils.System;  // TUtilsSystem.RunCommandLine — usado en bloque LINUX
 
 Type
 
@@ -87,8 +88,8 @@ Type
     procedure ConvertAudioIfNeeded(var aStream: TMemoryStream; var aFileName: String);
 
     { Implementaci?n de IAiSpeechTool }
-    procedure ExecuteTranscription(aMediaFile: TAiMediaFile; ResMsg, AskMsg: TAiChatMessage); virtual;
-    procedure ExecuteSpeechGeneration(const AText: string; ResMsg, AskMsg: TAiChatMessage); virtual;
+    procedure ExecuteTranscription(aMediaFile: TAiMediaFile; ResMsg, AskMsg: TAiChatMessage); override;
+    procedure ExecuteSpeechGeneration(const AText: string; ResMsg, AskMsg: TAiChatMessage); override;
     function InternalTranscription(aStream: TMemoryStream; aFileName, aPrompt: String): String;
 
   Public
@@ -217,34 +218,18 @@ procedure TAIWhisper.ExecuteTranscription(aMediaFile: TAiMediaFile; ResMsg, AskM
       LText := InternalTranscription(aMediaFile.Content, aMediaFile.filename, '');
       aMediaFile.Transcription := LText;
       aMediaFile.Procesado := True;
+      ResMsg.Prompt := LText;  // asignación directa para modo sync (igual que Gemini)
       ReportDataEnd(ResMsg, 'assistant', LText);
     except
       on E: Exception do
+      begin
         ReportError('Error en transcripci�n Whisper: ' + E.Message, E);
+      end;
     end;
   end;
 
 begin
-  if IsAsync then
-    DoTranscription
-  else
-    TTask.Run(
-      procedure
-      var
-        LText: string;
-      begin
-        try
-          ReportState(acsReasoning, 'Transcribiendo audio...');
-          LText := InternalTranscription(aMediaFile.Content, aMediaFile.filename, '');
-          aMediaFile.Transcription := LText;
-          aMediaFile.Procesado := True;
-          ReportDataEnd(ResMsg, 'assistant', LText);
-        except
-          on E: Exception do
-            ReportError('Error en transcripci�n Whisper: ' + E.Message, E);
-        end;
-      end
-    );
+  DoTranscription;
 end;
 
 procedure TAIWhisper.ExecuteSpeechGeneration(const AText: string; ResMsg, AskMsg: TAiChatMessage);
@@ -271,31 +256,7 @@ procedure TAIWhisper.ExecuteSpeechGeneration(const AText: string; ResMsg, AskMsg
   end;
 
 begin
-  if IsAsync then
-    DoSpeechGeneration
-  else
-    TTask.Run(
-      procedure
-      var
-        LStream: TMemoryStream;
-        LNewFile: TAiMediaFile;
-      begin
-        try
-          ReportState(acsWriting, 'Generando voz...');
-          LStream := Speech(AText);
-          try
-            LNewFile := TAiMediaFile.Create;
-            LNewFile.LoadFromStream('speech.' + FFormat, LStream);
-            ReportDataEnd(ResMsg, 'assistant', '[Audio generado]');
-          finally
-            LStream.Free;
-          end;
-        except
-          on E: Exception do
-            ReportError('Error generando voz Whisper: ' + E.Message, E);
-        end;
-      end
-    );
+  DoSpeechGeneration;
 end;
 
 { Encapsulamos la l?gica original en un m?todo interno para reutilizar }
@@ -500,7 +461,7 @@ begin
   Try
     aStream.Position := 0;
 
-    {$IF CompilerVersion >= 35}
+    {$IF CompilerVersion >= 36}
     Body.AddStream('file', aStream, False, aFileName, GetMimeTypeFromFileName(ExtractFileExt(aFileName)));
     {$ELSE}
     Body.AddStream('file', aStream, aFileName, GetMimeTypeFromFileName(ExtractFileExt(aFileName)));
@@ -575,7 +536,7 @@ begin
   Try
     aStream.Position := 0;
 
-    {$IF CompilerVersion >= 35}
+    {$IF CompilerVersion >= 36}
     Body.AddStream('file', aStream, False, aFileName, GetMimeTypeFromFileName(ExtractFileExt(aFileName)));
     {$ELSE}
     Body.AddStream('file', aStream, aFileName, GetMimeTypeFromFileName(ExtractFileExt(aFileName)));

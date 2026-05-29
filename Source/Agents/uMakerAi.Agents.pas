@@ -37,9 +37,7 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.Generics.Collections, System.Generics.Defaults, System.TypInfo,
-  System.Bindings.Evaluator, System.Bindings.Helper, System.Bindings.Expression, System.Bindings.Consts,
   System.JSON, System.Math,
-  System.Bindings.EvalSys, System.Bindings.Factories, System.Bindings.EvalProtocol, System.Bindings.ObjEval,
   System.Threading, System.Rtti, System.SyncObjs, System.Types, System.StrUtils,
 {$IF CompilerVersion < 35}
   uJSONHelper,
@@ -301,7 +299,7 @@ type
     FOnEnd: TAIAgentsOnEnd;
     FOnError: TAIAgentsOnError;
     FOnConfirm: TAIAgentsOnConfirm;
-    FBusy: Boolean;
+    FBusy: Integer;
     FAbort: Boolean;
     FBlackboard: TAIBlackboard;
     FCompiled: Boolean;
@@ -322,6 +320,7 @@ type
     FSuspendedSteps:     TObjectList<TAiPendingStep>; // owned
     FSuspendedStepsLock: TCriticalSection;
     FOnSuspend:          TAIAgentsOnSuspend;
+    function GetBusy: Boolean;
     procedure SetCheckpointer(const Value: IAiCheckpointer);
     procedure SetOnSuspend(const Value: TAIAgentsOnSuspend);
     procedure SetMaxConcurrentTasks(const Value: Integer);
@@ -374,14 +373,14 @@ type
     procedure SaveStateToStream(AStream: TStream);
     procedure LoadStateFromStream(AStream: TStream);
 
-    function Run(APrompt: String): String; overload; // Reemplaza al anterior
+    function Run(APrompt: String): String; overload; virtual;
 
     function AddMessageAndRun(APrompt, aRole: String; aMediaFiles: TAiMediaFilesArray): String;
     function AddMessageAndRunMsg(APrompt, aRole: String; aMediaFiles: TAiMediaFilesArray): TAiChatMessage;
 
     function NewMessage(APrompt, aRole: String; aMediaFiles: TAiMediaFilesArray): TAiChatMessage;
 
-    property Busy: Boolean read FBusy;
+    property Busy: Boolean read GetBusy;
     property Blackboard: TAIBlackboard read FBlackboard;
     property CurrentThreadID: string read FCurrentThreadID;
     // Reanuda un hilo suspendido. AInput es la respuesta/aprobaci?n del humano.
@@ -428,46 +427,109 @@ end;
 
 procedure Register;
 begin
+  {$WARN SYMBOL_DEPRECATED OFF}
   RegisterComponents('MakerAI', [TAIAgentManager, TAIAgentsNode, TAIAgentsLink, TAiAgentsToolSample, TAIAgents]);
+  {$WARN SYMBOL_DEPRECATED ON}
 end;
 
+// Simple expression evaluator for lmExpression link mode.
+// Supports: bare key (truthy), key=val, key<>val, key!=val, key>val,
+//           key<val, key>=val, key<=val.  Values are compared as strings
+// unless both sides parse as numbers.
 function EvalCondition(const Expr: string; Vars: TDictionary<string, TValue>): Boolean;
 var
-  LScope: IScope; // Mantiene la referencia viva (Interface)
-  LDictScope: TDictionaryScope; // Referencia de clase para acceder a .Map
-  BindingExpression: TBindingExpression;
-  Pair: TPair<string, TValue>;
-  Value: TValue;
-  ValueWrapper: IValue;
+  LExpr, LKey, LOp, LRhs: string;
+  LVal: TValue;
+  LLhs, LRhsNum: Double;
+  LFound: Boolean;
+  I, P: Integer;
+  Ops: array[0..5] of string;
+  Op: string;
 begin
-  // 1. Crear la instancia de clase
-  LDictScope := TDictionaryScope.Create;
+  Result := False;
+  LExpr := Trim(Expr);
+  if LExpr = '' then Exit;
 
-  // 2. VITAL: Asignar a una variable de Interfaz inmediatamente.
-  // Esto sube el RefCount a 1 y evita que se destruya prematuramente.
-  LScope := LDictScope;
+  Ops[0] := '<>';
+  Ops[1] := '!=';
+  Ops[2] := '>=';
+  Ops[3] := '<=';
+  Ops[4] := '>';
+  Ops[5] := '<';
 
-  // No necesitamos try..finally para el Scope, las interfaces se limpian solas.
-
-  // 3. Llenar las variables usando la referencia de clase (LDictScope)
-  for Pair in Vars do
+  LOp := '';
+  P   := 0;
+  // Check two-char ops first, then single-char =
+  for I := 0 to 5 do
   begin
-    ValueWrapper := TValueWrapper.Create(Pair.Value);
-    LDictScope.Map.Add(Pair.Key, ValueWrapper);
+    P := Pos(Ops[I], LExpr);
+    if P > 0 then begin LOp := Ops[I]; Break; end;
+  end;
+  if LOp = '' then
+  begin
+    P := Pos('=', LExpr);
+    if P > 0 then LOp := '=';
   end;
 
-  // 4. Crear la expresi?n pasando la INTERFAZ (LScope)
-  BindingExpression := TBindings.CreateExpression([LScope], Expr);
-  try
-    ValueWrapper := BindingExpression.Evaluate;
-    Value := ValueWrapper.GetValue;
-
-    if Value.IsType<Boolean> then
-      Result := Value.AsBoolean
+  if LOp = '' then
+  begin
+    // Bare key: truthy check
+    LKey := LExpr;
+    if not Vars.TryGetValue(LKey, LVal) then Exit;
+    if LVal.Kind = tkEnumeration then
+      Result := LVal.AsBoolean
+    else if LVal.Kind in [tkInteger, tkInt64, tkFloat] then
+      Result := LVal.AsExtended <> 0
+    else if LVal.Kind in [tkString, tkUString, tkLString, tkWString] then
+      Result := LVal.AsString <> ''
     else
-      raise Exception.CreateFmt('La expresi?n "%s" no devolvi? un Boolean', [Expr]);
-  finally
-    BindingExpression.Free;
+      Result := not LVal.IsEmpty;
+    Exit;
+  end;
+
+  LKey := Trim(Copy(LExpr, 1, P - 1));
+  LRhs := Trim(Copy(LExpr, P + Length(LOp), MaxInt));
+
+  LFound := Vars.TryGetValue(LKey, LVal);
+  if not LFound then
+  begin
+    Result := (LOp = '<>') or (LOp = '!=');
+    Exit;
+  end;
+
+  // Get LHS as string and number (if parseable)
+  var LLhsStr: string;
+  if LVal.Kind in [tkString, tkUString, tkLString, tkWString] then
+    LLhsStr := LVal.AsString
+  else if LVal.Kind = tkEnumeration then
+    LLhsStr := BoolToStr(LVal.AsBoolean, True)
+  else
+    LLhsStr := LVal.ToString;
+
+  var LLhsIsNum: Boolean := TryStrToFloat(LLhsStr, LLhs);
+  var LRhsIsNum: Boolean := TryStrToFloat(LRhs, LRhsNum);
+
+  if LLhsIsNum and LRhsIsNum then
+  begin
+    case IndexStr(LOp, ['=', '<>', '!=', '>', '<', '>=', '<=']) of
+      0:    Result := LLhs = LRhsNum;
+      1, 2: Result := LLhs <> LRhsNum;
+      3:    Result := LLhs > LRhsNum;
+      4:    Result := LLhs < LRhsNum;
+      5:    Result := LLhs >= LRhsNum;
+      6:    Result := LLhs <= LRhsNum;
+    end;
+  end
+  else
+  begin
+    case IndexStr(LOp, ['=', '<>', '!=', '>', '<', '>=', '<=']) of
+      0:    Result := SameText(LLhsStr, LRhs);
+      1, 2: Result := not SameText(LLhsStr, LRhs);
+      3:    Result := CompareText(LLhsStr, LRhs) > 0;
+      4:    Result := CompareText(LLhsStr, LRhs) < 0;
+      5:    Result := CompareText(LLhsStr, LRhs) >= 0;
+      6:    Result := CompareText(LLhsStr, LRhs) <= 0;
+    end;
   end;
 end;
 
@@ -568,29 +630,61 @@ begin
   end;
 end;
 
+// Formato tipado: cada entrada es {"t":"<tipo>","v":<valor>}
+// Tipos: "s"=string, "i"=integer, "i64"=int64, "f"=float, "b"=boolean, "e"=enum (ordinal como integer)
 procedure SerializeBlackboard(ABlackboard: TAIBlackboard; AJSONObject: TJSONObject);
 var
   LPair: TPair<string, TValue>;
+  LWrapper: TJSONObject;
 begin
-  // ADVERTENCIA: Esto solo funcionar? para tipos de TValue simples.
-  // No se pueden serializar objetos complejos, punteros o records.
   ABlackboard.FLock.Enter;
   try
     for LPair in ABlackboard.FData do
     begin
-      var
-      LValue := LPair.Value;
+      var LValue := LPair.Value;
+      LWrapper := nil;
       case LValue.Kind of
-        tkInteger, tkInt64:
-          AJSONObject.AddPair(LPair.Key, TJSONNumber.Create(LValue.AsInt64));
+        tkInteger:
+          begin
+            LWrapper := TJSONObject.Create;
+            LWrapper.AddPair('t', 'i');
+            LWrapper.AddPair('v', TJSONNumber.Create(LValue.AsInteger));
+          end;
+        tkInt64:
+          begin
+            LWrapper := TJSONObject.Create;
+            LWrapper.AddPair('t', 'i64');
+            LWrapper.AddPair('v', TJSONNumber.Create(LValue.AsInt64));
+          end;
         tkFloat:
-          AJSONObject.AddPair(LPair.Key, TJSONNumber.Create(LValue.AsExtended));
+          begin
+            LWrapper := TJSONObject.Create;
+            LWrapper.AddPair('t', 'f');
+            LWrapper.AddPair('v', TJSONNumber.Create(LValue.AsExtended));
+          end;
         tkString, tkUString:
-          AJSONObject.AddPair(LPair.Key, TJSONString.Create(LValue.AsString));
+          begin
+            LWrapper := TJSONObject.Create;
+            LWrapper.AddPair('t', 's');
+            LWrapper.AddPair('v', TJSONString.Create(LValue.AsString));
+          end;
         tkEnumeration:
-          if LValue.TypeInfo = System.TypeInfo(Boolean) then
-            AJSONObject.AddPair(LPair.Key, TJSONBool.Create(LValue.AsBoolean));
+          begin
+            LWrapper := TJSONObject.Create;
+            if LValue.TypeInfo = System.TypeInfo(Boolean) then
+            begin
+              LWrapper.AddPair('t', 'b');
+              LWrapper.AddPair('v', TJSONBool.Create(LValue.AsBoolean));
+            end
+            else
+            begin
+              LWrapper.AddPair('t', 'e');
+              LWrapper.AddPair('v', TJSONNumber.Create(LValue.AsOrdinal));
+            end;
+          end;
       end;
+      if Assigned(LWrapper) then
+        AJSONObject.AddPair(LPair.Key, LWrapper);
     end;
   finally
     ABlackboard.FLock.Leave;
@@ -600,19 +694,34 @@ end;
 procedure DeserializeBlackboard(AJSONObject: TJSONObject; ABlackboard: TAIBlackboard);
 var
   LPair: TJSONPair;
+  LWrapper: TJSONObject;
+  LType, LKey: string;
+  LVal: TJSONValue;
 begin
   ABlackboard.Clear;
   for LPair in AJSONObject do
   begin
-    var
-    LJsonValue := LPair.JsonValue;
-    if LJsonValue is TJSONString then
-      ABlackboard.SetString(LPair.JsonString.Value, LJsonValue.Value)
-    else if LJsonValue is TJSONNumber then
-      // Simplificaci?n: lo guardamos como float, se puede refinar
-      ABlackboard.SetValue(LPair.JsonString.Value, StrToFloat(LJsonValue.Value))
-    else if LJsonValue is TJSONBool then
-      ABlackboard.SetBoolean(LPair.JsonString.Value, (LJsonValue as TJSONBool).AsBoolean);
+    LKey := LPair.JsonString.Value;
+    if not (LPair.JsonValue is TJSONObject) then
+      Continue;
+    LWrapper := LPair.JsonValue as TJSONObject;
+    if not LWrapper.TryGetValue<string>('t', LType) then
+      Continue;
+    LVal := LWrapper.GetValue('v');
+    if not Assigned(LVal) then
+      Continue;
+    if LType = 's' then
+      ABlackboard.SetString(LKey, LVal.Value)
+    else if LType = 'i' then
+      ABlackboard.SetInteger(LKey, (LVal as TJSONNumber).AsInt)
+    else if LType = 'i64' then
+      ABlackboard.SetValue(LKey, TValue.From<Int64>((LVal as TJSONNumber).AsInt64))
+    else if LType = 'f' then
+      ABlackboard.SetValue(LKey, TValue.From<Double>((LVal as TJSONNumber).AsDouble))
+    else if LType = 'b' then
+      ABlackboard.SetBoolean(LKey, (LVal as TJSONBool).AsBoolean)
+    else if LType = 'e' then
+      ABlackboard.SetInteger(LKey, (LVal as TJSONNumber).AsInt);
   end;
 end;
 
@@ -787,6 +896,11 @@ end;
 procedure TAIAgentManager.Abort;
 begin
   FAbort := True;
+end;
+
+function TAIAgentManager.GetBusy: Boolean;
+begin
+  Result := FBusy <> 0;
 end;
 
 function TAIAgentManager.AddEdge(const AStartNodeName, AEndNodeName: string): TAIAgentManager;
@@ -981,7 +1095,7 @@ begin
   FActiveTasksLock := TCriticalSection.Create;
   FCompiled := False;
   FAsynchronous := True; // Default VCL behavior
-  FBusy := False;
+  FBusy := 0;
 
   // --- NUEVO: Inicializaci?n del Scheduler ---
   FMaxConcurrentTasks := 4;
@@ -1445,7 +1559,7 @@ begin
   Result := '';
 
   // 1. CHEQUEO DE BUSY (Thread safe check simple)
-  if FBusy then
+  if FBusy <> 0 then
     raise Exception.Create('The Agent Manager is currently busy.');
 
   // 2. GESTI?N DE MENSAJES
@@ -1510,12 +1624,11 @@ var
   InitialInput: String;
 begin
   // 1. Verificaci?n de estado ocupado
-  if TInterlocked.Exchange(FBusy, True) then
+  if TInterlocked.Exchange(FBusy, 1) <> 0 then
     raise Exception.Create('Agent is busy (InternalRun check).');
 
   Compile; // Asegura que el grafo est? listo
 
-  FBusy := True;
   FAbort := False;
 
   // --- Generar ThreadID ?nico para esta ejecuci?n ---
@@ -1666,7 +1779,7 @@ begin
           FOnFinish(Self, InitialInput, FinalOutput, FinalStatus, FinalException);
 
         // Liberar el flag de ocupado
-        TInterlocked.Exchange(FBusy, False);
+        TInterlocked.Exchange(FBusy, 0);
       end;
     end);
 end;
@@ -2271,7 +2384,7 @@ var
 begin
   Result := False;
 
-  if TInterlocked.Exchange(FBusy, True) then
+  if TInterlocked.Exchange(FBusy, 1) <> 0 then
     raise Exception.Create('Agent is busy');
 
   try
@@ -2288,7 +2401,7 @@ begin
       end
       else if FCurrentThreadID <> AThreadID then
       begin
-        TInterlocked.Exchange(FBusy, False);
+        TInterlocked.Exchange(FBusy, 0);
         Exit; // Thread no encontrado ni en disco ni en memoria
       end;
     finally
@@ -2299,7 +2412,7 @@ begin
     LNode := FindNode(ANodeName);
     if not Assigned(LNode) then
     begin
-      TInterlocked.Exchange(FBusy, False);
+      TInterlocked.Exchange(FBusy, 0);
       raise Exception.CreateFmt('Nodo "%s" no encontrado en el grafo', [ANodeName]);
     end;
 
@@ -2416,7 +2529,7 @@ begin
           if Assigned(FOnFinish) then
             FOnFinish(Self, LResumeInput, FinalOutput, FinalStatus, FinalException);
 
-          TInterlocked.Exchange(FBusy, False);
+          TInterlocked.Exchange(FBusy, 0);
         end;
       end, FThreadPool);
 
@@ -2425,7 +2538,7 @@ begin
 
     Result := True;
   except
-    TInterlocked.Exchange(FBusy, False);
+    TInterlocked.Exchange(FBusy, 0);
     raise;
   end;
 end;
@@ -3046,19 +3159,10 @@ begin
     begin
       FJoinLock.Enter;
       try
-        // Para jmAny: Limpiamos siempre para que el pr?ximo evento dispare de nuevo limpiamente.
-        if FJoinMode = jmAny then
-          FJoinInputs.Clear;
-
-        // Para jmAll: NO LIMPIAMOS.
-        // Esto permite el patr?n "CombineLatest". Si un flujo se repite (loop),
-        // el nodo recordar? los valores de los otros flujos que no cambiaron.
-        // La limpieza total solo ocurre al iniciar el grafo (Reset).
-
-        { CODIGO ELIMINADO:
-          if (FJoinMode = jmAll) and (FJoinInputs.Count >= FInEdges.Count) then
-          FJoinInputs.Clear;
-        }
+        // Limpiar siempre después de ejecutar, tanto jmAny como jmAll.
+        // Para jmAll: la limpieza garantiza que el próximo ciclo (retry/loop)
+        // espere correctamente todas las entradas antes de disparar de nuevo.
+        FJoinInputs.Clear;
       finally
         FJoinLock.Leave;
       end;

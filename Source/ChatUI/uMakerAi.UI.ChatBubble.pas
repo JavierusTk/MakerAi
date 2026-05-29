@@ -40,7 +40,10 @@ uses
   System.SysUtils, System.Classes, System.Types, System.UITypes, System.Math.Vectors, System.Math,
   System.UIConsts, System.Generics.Collections, System.IOUtils, FMX.Styles.Objects, System.JSON,
 
-  uMakerAi.Core, uJSONHelper,
+  uMakerAi.Core,
+{$IF CompilerVersion < 35}
+  uJSONHelper,
+{$ENDIF}
 
   FMX.Types, FMX.Controls, FMX.Graphics, FMX.Layouts, FMX.Memo, FMX.TextLayout, FMX.ImgList,
   FMX.StdCtrls, FMX.Objects, FMX.Forms;
@@ -288,11 +291,13 @@ type
     property OnPainting;
     property OnResize;
     property OnResized;
-  end;
+  end deprecated 'Use TAIChatView (AIChat.Control.FMX)';
 
 procedure Register;
 
 implementation
+
+{$WARN SYMBOL_DEPRECATED OFF}
 
 {$IFNDEF UIRESOURCES_LOADED}
 {$DEFINE UIRESOURCES_LOADED}
@@ -764,6 +769,7 @@ begin
     LMemo.WordWrap := True;
     LMemo.ReadOnly := True;
     LMemo.HitTest := True; // Cambiado para que los clics pasen a la burbuja
+    LMemo.ShowScrollBars := False;
     LMemo.StyledSettings := [];
     LMemo.TextSettings.Font.Assign(FContentFont);
     LMemo.TextSettings.HorzAlign := TTextAlign.Leading;
@@ -869,6 +875,7 @@ begin
     LMemo.WordWrap := True;
     LMemo.ReadOnly := True;
     LMemo.HitTest := True;
+    LMemo.ShowScrollBars := False;
     LMemo.StyledSettings := [];
     LMemo.TextSettings.Font.Assign(FContentFont);
     LMemo.TextSettings.HorzAlign := TTextAlign.Leading;

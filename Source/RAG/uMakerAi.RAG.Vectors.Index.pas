@@ -161,10 +161,12 @@ Type
   /// -------------------------------------------------------------------------
 
   TAIBasicEmbeddingIndex = class(TAIEmbeddingIndex)
-  private
-    procedure BuildIndex(Points: TRagItems);
-    function Search(Target: TAiEmbeddingNode; aLimit: Integer; aPrecision: Double): TRagItems;
+  protected
+    procedure InternalClear; override;
   public
+    procedure BuildIndex(Points: TRagItems); override;
+    function Search(Target: TAiEmbeddingNode; aLimit: Integer; aPrecision: Double): TRagItems; override;
+
     /// <summary>
     /// Versi�n thread-safe que NO modifica los nodos originales
     /// </summary>
@@ -174,7 +176,7 @@ Type
     /// Versi�n legacy para compatibilidad (DEPRECATED)
     /// </summary>
     class function InternalSearch(Target: TAiEmbeddingNode; aLimit: Integer; aPrecision: Double; Source: TRagItems): TRagItems; static;
-    constructor Create;
+    constructor Create; override;
     destructor Destroy; override;
   end;
 
@@ -182,6 +184,8 @@ Type
 
 
   TAIEuclideanDistanceIndex = class(TAIEmbeddingIndex)
+  protected
+    procedure InternalClear; override;
   public
     constructor Create; override;
     destructor Destroy; override;
@@ -263,7 +267,7 @@ Type
     FDocLengths: TDictionary<TAiEmbeddingNode, Integer>;
     FAvgDocLength: Double;
     FLanguage: TAiLanguage;
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 36}
     FStopWords: THashSet<string>;
 {$ELSE}
     FStopWords: TDictionary<string, Boolean>;
@@ -279,7 +283,7 @@ Type
     procedure Clear;
 
     property Language: TAiLanguage read FLanguage write SetLanguage;
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 36}
     property StopWords: THashSet<string> read FStopWords; // Permite a�adir palabras personalizadas
 {$ELSE}
     property StopWords: TDictionary<string, Boolean> read FStopWords;
@@ -548,6 +552,11 @@ begin
   inherited;
 end;
 
+procedure TAIBasicEmbeddingIndex.InternalClear;
+begin
+  // Sin estructura interna propia — la base de datos de nodos la gestiona TAiRAGVector
+end;
+
 constructor TAIBasicEmbeddingIndex.Create;
 begin
   Inherited;
@@ -555,7 +564,6 @@ end;
 
 destructor TAIBasicEmbeddingIndex.Destroy;
 begin
-
   inherited;
 end;
 
@@ -654,6 +662,11 @@ begin
 end;
 
 { TAIEuclideanDistanceIndex }
+
+procedure TAIEuclideanDistanceIndex.InternalClear;
+begin
+  // Sin estructura interna propia — la base de datos de nodos la gestiona TAiRAGVector
+end;
 
 procedure TAIEuclideanDistanceIndex.BuildIndex(Points: TRagItems);
 begin
@@ -1171,7 +1184,7 @@ begin
   inherited Create;
   FInvertedIndex := TDictionary < string, TList < TWordOccurrence >>.Create;
   FDocLengths := TDictionary<TAiEmbeddingNode, Integer>.Create;
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 36}
   FStopWords := THashSet<string>.Create;
 {$ELSE}
   FStopWords := TDictionary<string, Boolean>.Create;
@@ -1223,7 +1236,7 @@ begin
     begin
       CleanWord := W.Trim.ToLower;
       if CleanWord <> '' then
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 36}
         FStopWords.Add(CleanWord);
 {$ELSE}
         FStopWords.AddOrSetValue(CleanWord, True);
@@ -1259,7 +1272,7 @@ begin
   for W in Words do
   begin
     // Filtro de longitud m�nima y stop words (usando el HashSet para O(1))
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 36}
     if (W.Length > 2) and not FStopWords.Contains(W) then
 {$ELSE}
     if (W.Length > 2) and not FStopWords.ContainsKey(W) then

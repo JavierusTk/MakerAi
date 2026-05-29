@@ -1,6 +1,6 @@
-﻿// IT License
+﻿// MIT License
 //
-// Copyright (c) <year> <copyright holders>
+// Copyright (c) 2024 Gustavo Enríquez - CimaMaker
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -105,7 +105,7 @@ Begin
   Params.Clear;
   Params.Add('ApiKey=@OLLAMA_API_KEY');
   Params.Add('Model=llama3');
-  Params.Add('MaxTokens=4096');
+  Params.Add('Max_Tokens=4096');
   Params.Add('URL=http://localhost:11434/');
 End;
 
@@ -142,7 +142,6 @@ var
   LToolCallsArray: TJSonArray;
   LToolCall: TAiToolsFunction;
   LItem: TJSONValue;
-  LPair: TJSONPair;
 begin
   Result := TAiToolsFunctions.Create;
 
@@ -385,6 +384,12 @@ begin
       AJSONObject.AddPair('format', 'json');
     end;
 
+    // --- THINKING (Ollama v0.7.0+) ---
+    // Modelos con reasoning nativo (gemma4, qwen3, deepseek-r1, etc.) requieren
+    // "think":true a nivel raíz para activar el modo de razonamiento.
+    if (cap_Reasoning in ModelConfig.ModelCaps) and (ModelConfig.ThinkingLevel <> tlDefault) then
+      AJSONObject.AddPair('think', TJSONBool.Create(True));
+
     // --- MANEJO DE TOOLS ---
     If Tool_Active and (Trim(GetTools(TToolFormat.tfOpenAi).Text) <> '') then
     Begin
@@ -436,6 +441,7 @@ begin
       jOptions.Free; // Si no se añadió al padre, hay que liberarlo
 
     // Generación del String final
+    ApplyExtraBodyParams(AJSONObject);
     Result := AJSONObject.ToJSON;
 
   Finally
@@ -803,6 +809,10 @@ begin
   ResMsg.Completion_tokens := LEvalTokens;
   ResMsg.Total_tokens := LPromptTokens + LEvalTokens;
 
+  // Disparar evento thinking si el modelo retornó razonamiento
+  if (LReasoning <> '') and Assigned(OnReceiveThinking) then
+    OnReceiveThinking(Self, ResMsg, JObj, LRole, LReasoning);
+
   LAskMsg := GetLastMessage;
 
   // 4. LÓGICA DE LLAMADO A FUNCIONES (TOOLS)
@@ -850,11 +860,14 @@ begin
                 DoCallFunction(CapturaTool);
               except
                 on E: Exception do
+                begin
+                  CapturaTool.Response := '{"error": "' + StringReplace(E.Message, '"', '''', [rfReplaceAll]) + '"}';
                   TThread.Queue(nil,
                     procedure
                     begin
                       DoError('Function Execution Error: ' + CapturaTool.Name, E);
                     end);
+                end;
               end;
             end);
           TaskList[I].Start;
@@ -897,7 +910,7 @@ begin
     // --- CASO B: Respuesta de texto normal o final de cadena ---
 
     // B.1 Extracción automática de bloques de código si se solicita
-    if (cap_ExtractCode in ModelConfig.SessionCaps) and (ResMsg.Content <> '') then
+    if (cap_ExtractCode in SessionCaps) and (ResMsg.Content <> '') then
     begin
       Code := TMarkdownCodeExtractor.Create;
       try
@@ -1156,8 +1169,7 @@ begin
   end;
 end;
 
-Initialization
-
-TAiChatFactory.Instance.RegisterDriver(TAiOllamaChat);
+initialization
+  TAiChatFactory.Instance.RegisterDriver(TAiOllamaChat);
 
 end.

@@ -42,7 +42,10 @@ uses
 
    uMakerAi.RAG.Vectors.Index,  uMakerAi.RAG.Vectors.VQL,
 
-  uJSONHelper, uMakerAi.Embeddings.Core, uMakerAi.RAG.MetaData;
+{$IF CompilerVersion < 35}
+  uJSONHelper,
+{$ENDIF}
+  uMakerAi.Embeddings.Core, uMakerAi.RAG.MetaData;
 
 type
 
@@ -173,7 +176,6 @@ type
     procedure SetLexicalLanguage(const Value: TAiLanguage);
     procedure SetDriver(const Value: TAiVectorStoreDriverBase);
     procedure SetSearchOptions(const Value: TAiSearchOptions);
-    procedure NormalizeResults(aList: TList<TAiSearchResult>);
     // VQL advanced post-processing
     function  ApplyMMR(ASource: TAiRAGVector; ALambda: Double; ALimit: Integer): TAiRAGVector;
     procedure ApplyDistinct(AVector: TAiRAGVector; const AField: string);
@@ -214,9 +216,9 @@ type
     Function SearchText(aPrompt: String; aLimit: Integer = 10; aPrecision: Double = 0.5; aFilter: TAiFilterCriteria = nil; IncludeMetadata: Boolean = True; IncludeScore: Boolean = True): String; Overload; Virtual;
     Function SearchText(aPrompt: TAiEmbeddingNode; aLimit: Integer = 10; aPresicion: Double = 0.5; aFilter: TAiFilterCriteria = nil; IncludeMetadata: Boolean = True; IncludeScore: Boolean = True): String; Overload; Virtual;
 
-    function ExecuteVGQL(const AVgqlQuery: string): string; overload;
+    function ExecuteVQL(const AVqlQuery: string): string; overload;
 
-    function ExecuteVGQL(const AVgqlQuery: string; out AResultVector: TAiRAGVector): string; overload;
+    function ExecuteVQL(const AVqlQuery: string; out AResultVector: TAiRAGVector): string; overload;
 
     Function VectorToContextText(DataVec: TAiRAGVector; IncludeMetadata: Boolean; IncludeScore: Boolean): String;
 
@@ -289,7 +291,6 @@ function TAiRAGVector.AddItem(aItem: TAiEmbeddingNode; MetaData: TAiEmbeddingMet
 var
   Handled: Boolean;
 begin
-  Result := -1;
   Handled := False;
 
   FLock.BeginWrite;
@@ -458,7 +459,7 @@ function TAiRAGVector.AddItemsFromPlainText(aText: String; MetaData: TAiEmbeddin
 const
   TOLERANCE_PCT = 0.15; // 15% de tolerancia para buscar cortes limpios
 var
-  TotalLen, StartPos, EndPos, NextStartPos: Integer;
+  TotalLen, StartPos, NextStartPos: Integer;
   IdealEnd, MaxEnd, MinEnd: Integer;
   CutPos: Integer;
   OverlapChars: Integer;
@@ -471,12 +472,11 @@ var
   function FindSmartCut(LimitStart, LimitEnd: Integer): Integer;
   var
     k: Integer;
-    LastPeriod, LastSpace, LastNewLine: Integer;
+    LastPeriod, LastSpace: Integer;
     C: Char;
   begin
     LastPeriod := -1;
     LastSpace := -1;
-    LastNewLine := -1;
 
     // Recorremos hacia atr�s desde el l�mite m�ximo permitido
     // Buscamos el corte "m�s lejano" posible que sea sem�nticamente correcto
@@ -495,7 +495,7 @@ var
       end;
 
       // Prioridad 2: Puntuaci�n de fin de frase
-      if (C in ['.', '?', '!', ';']) and (LastPeriod = -1) then
+      if CharInSet(C, ['.', '?', '!', ';']) and (LastPeriod = -1) then
         LastPeriod := k;
 
       // Prioridad 3: Espacio
@@ -562,7 +562,8 @@ begin
 
       if ChunkText <> '' then
       begin
-        Metadata.Properties['Posicion'] := I;
+        if Assigned(Metadata) then
+          Metadata.Properties['Posicion'] := I;
         Emb := AddItem(ChunkText, MetaData);
         if Assigned(Emb) then
         begin
@@ -598,8 +599,11 @@ begin
 
     if ChunkText <> '' then
     begin
-      Metadata.Properties['Posicion'] := I;
-      Metadata.Properties['FechaDoc'] := EncodeDate(Random(20)+2000,Random(11)+1,01);
+      if Assigned(Metadata) then
+      begin
+        Metadata.Properties['Posicion'] := I;
+        Metadata.Properties['FechaDoc'] := EncodeDate(Random(20)+2000,Random(11)+1,01);
+      end;
 
       Emb := AddItem(ChunkText, MetaData);
       if Assigned(Emb) then
@@ -624,7 +628,7 @@ begin
       // Mientras el caracter ANTERIOR no sea un separador (espacio, punto, salto),
       // significa que estamos dentro de una palabra. Retrocedemos.
       while (NextStartPos > StartPos + 1) and // No retroceder m�s all� del inicio anterior
-        (not(aText[NextStartPos - 1] in [' ', #13, #10, '.', ',', ';', ':', '!', '?'])) do
+        (not CharInSet(aText[NextStartPos - 1], [' ', #13, #10, '.', ',', ';', ':', '!', '?'])) do
       begin
         Dec(NextStartPos);
       end;
@@ -797,6 +801,7 @@ begin
 
   // Result := FRagIndex.Connect(aHost, aPort, aLogin, aPassword);
   FActive := True;
+  Result := True;
 end;
 
 function TAiRAGVector.Count: Integer;
@@ -1034,7 +1039,7 @@ begin
 
 end;
 
-function TAiRAGVector.ExecuteVGQL(const AVgqlQuery: string; out AResultVector: TAiRAGVector): string;
+function TAiRAGVector.ExecuteVQL(const AVqlQuery: string; out AResultVector: TAiRAGVector): string;
 var
   Parser: TVGQLParser;
   AST: TVGQLQuery;
@@ -1046,13 +1051,12 @@ var
 begin
   Result := '';
   AResultVector := nil;
-  AST := nil;
   Req := nil;
 
   // ---------------------------------------------------------------------------
   // 1. FRONT-END: PARSEO DE LA SINTAXIS (Texto -> AST)
   // ---------------------------------------------------------------------------
-  Parser := TVGQLParser.Create(AVgqlQuery);
+  Parser := TVGQLParser.Create(AVqlQuery);
   try
     AST := Parser.Parse;
   finally
@@ -1548,12 +1552,11 @@ begin
   end;
 end;
 
-function TAiRAGVector.ExecuteVGQL(const AVgqlQuery: string): string;
+function TAiRAGVector.ExecuteVQL(const AVqlQuery: string): string;
 var
   TempVec: TAiRAGVector;
 begin
-  // Versi�n simplificada que libera el vector autom�ticamente
-  Result := ExecuteVGQL(AVgqlQuery, TempVec);
+  Result := ExecuteVQL(AVqlQuery, TempVec);
   if Assigned(TempVec) then
     TempVec.Free;
 end;
@@ -1733,39 +1736,6 @@ begin
   Finally
     JObj.Free;
   End;
-end;
-
-procedure TAiRAGVector.NormalizeResults(aList: TList<TAiSearchResult>);
-var
-  MaxS, MinS, Range: Double;
-  i: Integer;
-  Rg: TAiSearchResult;
-begin
-  if aList.Count = 0 then
-    Exit;
-
-  // 1. Encontrar Min y Max
-  MaxS := -1;
-  MinS := 999999;
-  for i := 0 to aList.Count - 1 do
-  begin
-    if aList[i].Score > MaxS then
-      MaxS := aList[i].Score;
-    if aList[i].Score < MinS then
-      MinS := aList[i].Score;
-  end;
-
-  // 2. Aplicar Min-Max
-  Range := MaxS - MinS;
-  for i := 0 to aList.Count - 1 do
-  begin
-    Rg := aList[i];
-
-    if Range > 0 then
-      Rg.Score := (aList[i].Score - MinS) / Range
-    else
-      Rg.Score := 1.0; // Caso un solo resultado o todos iguales
-  end;
 end;
 
 procedure TAiRAGVector.Notification(AComponent: TComponent; Operation: TOperation);
@@ -2055,7 +2025,6 @@ end;
 function TAiRAGVector.Search(Target: TAiEmbeddingNode; aLimit: Integer; aPrecision: Double; aFilter: TAiFilterCriteria): TAiRAGVector;
 var
   Handled: Boolean;
-  FilteredSource: TAiRAGVector;
   VectorResults: TList<TAiSearchResult>;
   LexicalRes: TList<TPair<Double, TAiEmbeddingNode>>;
   SearchResult: TAiSearchResult;
