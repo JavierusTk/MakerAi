@@ -37,7 +37,7 @@ interface
 
 uses
   System.SysUtils, System.StrUtils, System.Classes, System.Generics.Collections,
-  System.JSON, Rest.JSON, System.IOUtils,
+  System.JSON, Rest.JSON, System.IOUtils, uMakerAi.Guardrails,
   System.Net.HttpClient, System.NetEncoding,
   System.SyncObjs,
   Data.Db,
@@ -82,6 +82,7 @@ type
     constructor Create(Collection: TCollection); Override;
     Destructor Destroy; Override;
     function GetNamePath: string; override;
+    procedure Assign(Source: TPersistent); override;
     Function ToJSon(Detail: Boolean = False): TJSonObject;
     procedure SetJSon(Value: TJSonObject);
 
@@ -130,6 +131,12 @@ type
     // ToJSon lo usa directamente en lugar de reconstruir desde TFunctionParamsItems.
     // Útil para herramientas con schemas complejos (anyOf, nested objects, etc.)
     FRawSchemaJson: String;
+    // Async tool calling (Responses API, gpt-6-astra en adelante): el modelo
+    // sigue razonando, llamando otras tools o contestando partes
+    // independientes mientras la aplicacion ejecuta ESTA. El resultado se
+    // devuelve despues con su call_id original. Los proveedores que no lo
+    // soportan simplemente no ven el campo.
+    FIsAsync: Boolean;
     procedure SetEnabled(const Value: Boolean);
     procedure SetOnAction(const Value: TFunctionEvent);
     procedure SetDefault(const Value: Boolean);
@@ -146,6 +153,7 @@ type
     constructor Create(Collection: TCollection); Override;
     Destructor Destroy; Override;
     function GetNamePath: string; override;
+    procedure Assign(Source: TPersistent); override;
 
     Function ToJSon(Detail: Boolean = False): TJSonObject;
     Procedure SetJSon(Value: TJSonObject);
@@ -153,6 +161,8 @@ type
     Property TagObject: TObject read FTagObject write SetTagObject;
     // Schema JSON completo (alternativa a TFunctionParamsItems para schemas complejos)
     property RawSchemaJson: String read FRawSchemaJson write FRawSchemaJson;
+    // Declara la tool como asincrona ante los proveedores que lo soportan.
+    property IsAsync: Boolean read FIsAsync write FIsAsync;
   published
     property Enabled: Boolean read FEnabled write SetEnabled default True;
     property FunctionName: string read GetDisplayName write SetDisplayName;
@@ -223,6 +233,7 @@ type
   public
     constructor Create(Collection: TCollection); override;
     destructor Destroy; override;
+    procedure Assign(Source: TPersistent); override;
     procedure UpdateClientProperties;
     // Propiedad para acceder al objeto cliente real
     property MCPClient: TMCPClientCustom read FMCPClient;
@@ -314,6 +325,9 @@ type
     // AutoMCP: funciones internas (invisibles al developer, no en FFunctions)
     FAutoMCPFunctions: TFunctionActionItems;
     FAutoMCPLock: TCriticalSection; // serializa llamadas a call_mcp_tool
+    // Guardrails: politica de seguridad de tool calls (opt-in)
+    FGuardrails: TAiGuardrails;
+    procedure SetGuardrails(const Value: TAiGuardrails);
     procedure SetOnMCPStreamMessage(const Value: TMCPStreamMessageEvent);
     procedure SetAutoMCPConfig(const Value: TAutoMCPConfig);
     function IsAutoMCPAllowed(const APkgName: string): Boolean;
@@ -332,6 +346,7 @@ type
 
     procedure DoLog(const Msg: string); virtual;
     procedure DoStatusUpdate(const StatusMsg: string); virtual;
+    procedure Notification(AComponent: TComponent; Operation: TOperation); override;
 
   Public
     Constructor Create(AOwner: TComponent); Override;
@@ -368,14 +383,14 @@ type
     // Integración con PPM (registry público de herramientas MCP)
     // SearchPPMMCP: busca herramientas MCP en el registry. El llamador libera el TJSONObject.
     function SearchPPMMCP(const AQuery: String; APage: Integer = 1; APerPage: Integer = 20;
-      const ARegistryUrl: String = 'https://registry.pascalai.org'): TJSONObject;
+      const ARegistryUrl: String = 'https://registry.cimamaker.com'): TJSONObject;
 
     // ImportMCPFromPPM: registra una herramienta MCP desde PPM como stub StdIo sin descargar.
     // Útil cuando el binario ya está instalado manualmente; el llamador debe asignar
     // Params['Command'] con la ruta al ejecutable antes de habilitar el item.
     // AVersion vacío = resuelve la última versión disponible.
     function ImportMCPFromPPM(const AName: String; const AVersion: String = '';
-      const ARegistryUrl: String = 'https://registry.pascalai.org'): TMCPClientItem;
+      const ARegistryUrl: String = 'https://registry.cimamaker.com'): TMCPClientItem;
 
     // InstallMCPFromPPM: descarga el .paipkg desde el registry, extrae el binario y
     // registra el cliente StdIo listo para usar.
@@ -384,13 +399,13 @@ type
     // Retorna el TMCPClientItem configurado, o nil si falla.
     function InstallMCPFromPPM(const AName: String; const AVersion: String = '';
       const AInstallDir: String = '';
-      const ARegistryUrl: String = 'https://registry.pascalai.org'): TMCPClientItem;
+      const ARegistryUrl: String = 'https://registry.cimamaker.com'): TMCPClientItem;
 
     // GetMCPSchema: retorna el JSON Schema de una herramienta MCP del registry.
     // El llamador es responsable de liberar el TJSONObject devuelto.
     // AVersion vacío = resuelve la última versión disponible.
     function GetMCPSchema(const AName: String; const AVersion: String = '';
-      const ARegistryUrl: String = 'https://registry.pascalai.org'): TJSONObject;
+      const ARegistryUrl: String = 'https://registry.cimamaker.com'): TJSONObject;
 
     // GetAutoMCPSystemPrompt: retorna un system prompt listo para usar que instruye
     // al LLM a utilizar las herramientas PPM (ppm_search, ppm_install, call_mcp_tool).
@@ -412,6 +427,11 @@ type
     // Tiene prioridad sobre Allowed/Blocked. AAllow=True por defecto.
     property OnAutoMCPRequest: TAutoMCPRequestEvent read FOnAutoMCPRequest write FOnAutoMCPRequest;
 
+    // Guardrails: si se asigna, cada tool call (local, MCP o AutoMCP) pasa por
+    // la politica ANTES de ejecutarse; un bloqueo se reporta al LLM como error
+    // JSON sin ejecutar el tool.
+    property Guardrails: TAiGuardrails read FGuardrails write SetGuardrails;
+
   End;
 
 
@@ -424,12 +444,16 @@ type
     FName: string;
     FDescription: string;
     FInputSchema: TJSonObject; // Siempre clonado y de nuestra propiedad
+    FIsAsync: Boolean;
   public
     constructor Create(const AName, ADescription: string; AInputSchema: TJSonObject);
     destructor Destroy; override;
     property Name: string read FName;
     property Description: string read FDescription;
     property InputSchema: TJSonObject read FInputSchema;
+    // Sobrevive a la normalizacion para poder reemitirse en los formatos que
+    // lo entienden (hoy solo tfOpenAIResponses). Los demas lo ignoran.
+    property IsAsync: Boolean read FIsAsync write FIsAsync;
   end;
 
   TJsonToolUtils = class
@@ -475,7 +499,7 @@ procedure Register;
 
 implementation
 
-uses uMakerAi.Chat, System.Zip, System.IniFiles;
+uses uMakerAi.Chat, System.Zip, System.IniFiles, uMakerAi.Telemetry;
 
 procedure Register;
 begin
@@ -500,6 +524,32 @@ begin
   FParams.Free;
   FScript.Free;
   inherited;
+end;
+
+// ISSUE #125: ver nota en TFunctionParamsItem.Assign.
+procedure TFunctionActionItem.Assign(Source: TPersistent);
+var
+  Src: TFunctionActionItem;
+begin
+  if Source is TFunctionActionItem then
+  begin
+    Src := TFunctionActionItem(Source);
+    FEnabled := Src.FEnabled;
+    FName := Src.FName;
+    FOnAction := Src.FOnAction;
+    FDefault := Src.FDefault;
+    FDescription.Assign(Src.FDescription);
+    FTagObject := Src.FTagObject;
+    FTag := Src.FTag;
+    FToolType := Src.FToolType;
+    FScript.Assign(Src.FScript);
+    FParams.Assign(Src.FParams);
+    FRawSchemaJson := Src.FRawSchemaJson;
+    FIsAsync := Src.FIsAsync;
+    Changed(False);
+  end
+  else
+    inherited;
 end;
 
 function TFunctionActionItem.GetDisplayName: string;
@@ -687,6 +737,11 @@ begin
 
     If Assigned(Params) then
       Fun.AddPair('parameters', Params);
+
+    // Solo se escribe cuando es True: un "async": false explicito no aporta
+    // nada y ensuciaria el schema de los proveedores que no lo conocen.
+    If FIsAsync then
+      Fun.AddPair('async', TJSONBool.Create(True));
 
     Result.AddPair('type', 'function');
     Result.AddPair('function', Fun);
@@ -927,6 +982,27 @@ destructor TFunctionParamsItem.Destroy;
 begin
   Description.Free;
   inherited;
+end;
+
+// ISSUE #125: los items de coleccion necesitan Assign para el streaming de
+// formularios/datamodules heredados; sin el, TPersistent.Assign lanza
+// "Cannot assign TFunctionParamsItem to TFunctionParamsItem".
+procedure TFunctionParamsItem.Assign(Source: TPersistent);
+var
+  Src: TFunctionParamsItem;
+begin
+  if Source is TFunctionParamsItem then
+  begin
+    Src := TFunctionParamsItem(Source);
+    FName := Src.FName;
+    FParamType := Src.FParamType;
+    FRequired := Src.FRequired;
+    FDescription.Assign(Src.FDescription);
+    FEnum := Src.FEnum;
+    Changed(False);
+  end
+  else
+    inherited;
 end;
 
 function TFunctionParamsItem.GetDisplayName: string;
@@ -1370,14 +1446,43 @@ var
   ArgsObject, ResultObject: TJSonObject;
   AExtractedMedia: TObjectList<TAiMediaFile>; // Lista temporal
   MF: TAiMediaFile;
+  LSpan: TAiSpan;
 begin
   Result := False;
 
   AExtractedMedia := TObjectList<TAiMediaFile>.Create;
 
+  // Telemetria: span por ejecucion de tool (GenAI semconv). Se anida
+  // automaticamente al span del turno de chat cuando corre en el mismo hilo.
+  LSpan := AiSpanStart('execute_tool ' + ToolCall.Name);
+  AiSpanAttr(LSpan, 'gen_ai.operation.name', 'execute_tool');
+  AiSpanAttr(LSpan, 'gen_ai.tool.name', ToolCall.Name);
+
   try
     if SameText(Copy(ToolCall.Name, 1, Length('local' + MCP_TOOL_SEP)), 'local' + MCP_TOOL_SEP) then
       ToolCall.Name := Copy(ToolCall.Name, Length('local' + MCP_TOOL_SEP) + 1, Length(ToolCall.Name));
+
+    // Guardrails: politica de seguridad previa a CUALQUIER ejecucion de tool
+    // (local, MCP o AutoMCP). Si bloquea, el tool NO se ejecuta y el LLM
+    // recibe el motivo como error para que pueda replantear su plan.
+    if Assigned(FGuardrails) then
+    begin
+      var LGuardReason: string;
+      if not FGuardrails.CheckToolCall(ToolCall.Name, ToolCall.Arguments, LGuardReason) then
+      begin
+        var LErrObj := TJSonObject.Create;
+        try
+          LErrObj.AddPair('error', 'Blocked by guardrails: ' + LGuardReason);
+          ToolCall.Response := LErrObj.ToJSON;
+        finally
+          LErrObj.Free;
+        end;
+        AiSpanAttr(LSpan, 'guardrail.blocked', True);
+        DoLog('Guardrails bloqueo el tool "' + ToolCall.Name + '": ' + LGuardReason);
+        Result := True; // atendido: se reporta al LLM sin ejecutar el tool
+        Exit;
+      end;
+    end;
 
     PosAt := Pos(MCP_TOOL_SEP, ToolCall.Name);
 
@@ -1489,19 +1594,40 @@ begin
       end
       else
       begin
-        // Cliente no encontrado, deshabilitado o no disponible.
-        // Setear Response para que el driver pueda enviar un tool result válido al LLM.
-        if not Assigned(ClientItem) then
-          ToolCall.Response := Format('{"error":"MCP server ''%s'' not found"}', [ServerName])
-        else if not ClientItem.Enabled then
-          ToolCall.Response := Format('{"error":"MCP server ''%s'' is disabled"}', [ServerName])
+        // El nombre contiene MCP_TOOL_SEP pero NO hay servidor MCP que lo
+        // respalde. Antes de dar el error, se busca por nombre COMPLETO en las
+        // funciones registradas: '_99_' es una convencion interna nuestra, no
+        // una secuencia reservada, y quien declara una tool tiene todo el
+        // derecho a llamarla 'alfa_99_beta'. Sin esta salida, una tool asi
+        // quedaba muda: se respondia 'MCP server not found' y el modelo se
+        // inventaba una explicacion sobre un servidor caido en vez de emitir
+        // el tool_call.
+        Funcion := FFunctions.GetFunction(ToolCall.Name);
+        if Assigned(Funcion) and Assigned(Funcion.OnAction) then
+          Funcion.OnAction(Self, Funcion, ToolCall.Name, ToolCall, Result)
         else
-          ToolCall.Response := Format('{"error":"MCP server ''%s'' is not available"}', [ServerName]);
-        Result := True;
+        begin
+          // Cliente no encontrado, deshabilitado o no disponible.
+          // Setear Response para que el driver pueda enviar un tool result válido al LLM.
+          if not Assigned(ClientItem) then
+            ToolCall.Response := Format('{"error":"MCP server ''%s'' not found"}', [ServerName])
+          else if not ClientItem.Enabled then
+            ToolCall.Response := Format('{"error":"MCP server ''%s'' is disabled"}', [ServerName])
+          else
+            ToolCall.Response := Format('{"error":"MCP server ''%s'' is not available"}', [ServerName]);
+          Result := True;
+        end;
       end;
     end;
 
   finally
+    // Telemetria: un ToolCall.Response con '"error"' marca el span como fallido
+    if Result and Assigned(LSpan) and (Pos('"error"', ToolCall.Response) > 0) then
+      AiSpanEnd(LSpan, 'tool returned error response')
+    else if not Result then
+      AiSpanEnd(LSpan, 'tool not found or not handled')
+    else
+      AiSpanEnd(LSpan);
     // Liberamos la lista temporal.
     // Si transferimos los archivos, OwnsObjects estar� en False y no los borrar�.
     // Si fall� algo, OwnsObjects estar� en True y borrar� los temporales para no dejar fugas.
@@ -1515,6 +1641,23 @@ begin
   if Assigned(FOnLog) then
     FOnLog(Self, Msg);
 
+end;
+
+procedure TAiFunctions.SetGuardrails(const Value: TAiGuardrails);
+begin
+  if FGuardrails <> Value then
+  begin
+    FGuardrails := Value;
+    if Assigned(FGuardrails) then
+      FGuardrails.FreeNotification(Self);
+  end;
+end;
+
+procedure TAiFunctions.Notification(AComponent: TComponent; Operation: TOperation);
+begin
+  inherited;
+  if (Operation = opRemove) and (AComponent = FGuardrails) then
+    FGuardrails := nil;
 end;
 
 procedure TAiFunctions.DoStatusUpdate(const StatusMsg: string);
@@ -1761,7 +1904,12 @@ begin
     LocalToolsObj := TJSonObject.Create;
     var LLocalTools := FFunctions.ToJSon;
     LocalToolsObj.AddPair('tools', LLocalTools);
-    TJsonToolUtils.NormalizeToolsFromSource('local', LocalToolsObj, LAllNormalizedTools); // Usamos 'local' o un nombre vacío
+    // Fuente vacia = SIN prefijo: las funciones locales viajan al proveedor con su
+    // nombre real. El prefijo 'local_99_' confundia a Claude en continuaciones
+    // multi-turn (con el tool_use del historial renombrado, re-ejecutaba la tool en
+    // vez de responder). El dispatch no lo necesita: DoCallFunction resuelve nombres
+    // sin separador como funcion local, y sigue aceptando 'local_99_' legado.
+    TJsonToolUtils.NormalizeToolsFromSource('', LocalToolsObj, LAllNormalizedTools);
 
     // 1b. FUNCIONES INTERNAS DE AUTOMCP (ppm_search, ppm_install, call_mcp_tool)
     // Lazy init: si Active=True pero las funciones aún no existen (ej: Active activado
@@ -1773,7 +1921,9 @@ begin
       var LAutoObj := TJSonObject.Create;
       try
         LAutoObj.AddPair('tools', FAutoMCPFunctions.ToJSon);
-        TJsonToolUtils.NormalizeToolsFromSource('local', LAutoObj, LAllNormalizedTools);
+        // Igual que las locales: sin prefijo (ppm_search/ppm_install/call_mcp_tool
+        // se despachan por nombre limpio en DoCallFunction).
+        TJsonToolUtils.NormalizeToolsFromSource('', LAutoObj, LAllNormalizedTools);
       finally
         LAutoObj.Free;
       end;
@@ -2433,7 +2583,7 @@ begin
   LFn := TFunctionActionItem(FAutoMCPFunctions.Add);
   LFn.FunctionName := 'ppm_search';
   LFn.Description.Text :=
-    'Search for MCP tools in the PPM registry (registry.pascalai.org). ' +
+    'Search for MCP tools in the PPM registry (registry.cimamaker.com). ' +
     'Returns a list of available tools matching the query with their names, ' +
     'descriptions and available functions. Call this before ppm_install.';
   LFn.Enabled := True;
@@ -3001,7 +3151,7 @@ constructor TAutoMCPConfig.Create;
 begin
   inherited Create;
   FActive := False;
-  FRegistryUrl := 'https://registry.pascalai.org';
+  FRegistryUrl := 'https://registry.cimamaker.com';
   FAllowed := TStringList.Create;
   FBlocked := TStringList.Create;
 end;
@@ -3378,6 +3528,30 @@ begin
   if FOwned and Assigned(FMCPClient) then
     FreeAndNil(FMCPClient);
   inherited;
+end;
+
+// ISSUE #125: ver nota en TFunctionParamsItem.Assign. No se copia FMCPClient:
+// cada item es propietario de su cliente interno (FOwned) y copiar el puntero
+// causaria una doble liberacion; se copian las propiedades proxy y
+// UpdateClientProperties las propaga al cliente real.
+procedure TMCPClientItem.Assign(Source: TPersistent);
+var
+  Src: TMCPClientItem;
+begin
+  if Source is TMCPClientItem then
+  begin
+    Src := TMCPClientItem(Source);
+    FEnabled := Src.FEnabled;
+    FConnected := Src.FConnected;
+    FName := Src.FName;
+    SetTransportType(Src.GetTransportType); // recrea el cliente interno si el tipo difiere
+    FParams.Assign(Src.FParams);   // OnChange propaga a FMCPClient.Params
+    FEnvVars.Assign(Src.FEnvVars); // OnChange propaga a FMCPClient.EnvVars
+    UpdateClientProperties;        // sincroniza nombre/enabled al cliente interno
+    Changed(False);
+  end
+  else
+    inherited;
 end;
 
 function TMCPClientItem.GetConfiguration: string;
@@ -3830,6 +4004,7 @@ var
   PropName: string;
   I: Integer;
   ExistsInReq: Boolean;
+  TypeV: TJSONValue;
 begin
   if not(ASchema is TJSonObject) then
     Exit;
@@ -3837,7 +4012,13 @@ begin
   JObj := TJSonObject(ASchema);
 
   // Verificamos si es un objeto (tiene propiedades o es type object expl�cito)
-  if (JObj.TryGetValue<TJSonObject>('properties', JProps)) or (JObj.GetValue<string>('type') = 'object') then
+  // 'type' puede ser un ARRAY en JSON Schema (p.ej. ["integer","string"]):
+  // GetValue<string> revienta con TJSONArray (visto 2026-09-30 con las tools
+  // de memoria de MKAIServer contra gpt-6). Lectura tolerante: aqui solo
+  // interesa saber si el nodo es un objeto.
+  TypeV := JObj.GetValue('type');
+  if (JObj.TryGetValue<TJSonObject>('properties', JProps)) or
+     ((TypeV is TJSONString) and (TJSONString(TypeV).Value = 'object')) then
   begin
     // REGLA 1: additionalProperties: false es OBLIGATORIO
     if JObj.GetValue('additionalProperties') <> nil then
@@ -3985,7 +4166,11 @@ begin
     LInputSchema.AddPair('properties', TJSonObject.Create);
   end;
 
-  AToolList.Add(TNormalizedTool.Create(LName, LDescription, LInputSchema));
+  var LNorm := TNormalizedTool.Create(LName, LDescription, LInputSchema);
+  // 'async' puede venir en la raiz (formato plano de Responses) o dentro de
+  // 'function' (formato clasico); LDataSource ya apunta al sitio correcto.
+  LNorm.IsAsync := LDataSource.GetValue<Boolean>('async', False);
+  AToolList.Add(LNorm);
 end;
 
 class procedure TJsonToolUtils.NormalizeToolsFromSource(const ASourceName: string; ASourceJson: TJSonObject; ANormalizedList: TList<TNormalizedTool>);
@@ -4195,6 +4380,13 @@ begin
   Result := TJSonObject.Create;
   Result.AddPair('type', 'function');
   Result.AddPair('name', ANormalizedTool.Name);
+
+  // Async tool calling: el modelo sigue trabajando mientras la aplicacion
+  // ejecuta esta tool, y el resultado se entrega despues con su call_id.
+  // Solo lo entiende la Responses API de gpt-6-astra en adelante; por eso se
+  // emite aqui y no en los otros formateadores.
+  if ANormalizedTool.IsAsync then
+    Result.AddPair('async', TJSONBool.Create(True));
 
   if not ANormalizedTool.Description.IsEmpty then
     Result.AddPair('description', ANormalizedTool.Description);

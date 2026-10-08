@@ -1,18 +1,18 @@
-﻿// IT License
+﻿// MIT License
 //
 // Copyright (c) <year> <copyright holders>
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
-// o use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
 //
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
 //
-// HE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
@@ -151,6 +151,9 @@ type
   TAiMistralChat = Class(TAiChat)
   Private
     FOcrIncludeImages: Boolean;
+    FOcrIncludeBlocks: Boolean;  // OCR 4 (jun 2026): bloques con bounding boxes
+    FTtsVoice: string;           // Voxtral TTS: slug del catalogo /v1/audio/voices (OBLIGATORIO)
+    FTtsFormat: string;          // mp3 | wav | pcm | flac | opus
     FDocumentImageLimit: integer;
     FDocumentPageLimit: integer;
     FOcrBboxAnnotationSchema: TStringList;
@@ -175,6 +178,8 @@ type
     function InternalRunNativePDFDescription(aMediaFile: TAiMediaFile; ResMsg, AskMsg: TAiChatMessage): String; Override;
     function InternalRunNativeTranscription(aMediaFile: TAiMediaFile; ResMsg, AskMsg: TAiChatMessage): String; Override;
     function InternalRunCompletions(ResMsg, AskMsg: TAiChatMessage): String; Override;
+    // Voxtral TTS (mar 2026): POST /v1/audio/speech con voxtral-mini-tts-2603
+    function InternalRunNativeSpeechGeneration(ResMsg, AskMsg: TAiChatMessage): String; Override;
 
     // function InternalRunOcr(aMediaFile: TAiMediaFile): String;
     function ParseOcrResponse(jResponse: TJSONObject; ResMsg: TAiChatMessage): string;
@@ -198,6 +203,15 @@ type
 
   Published
     property OcrIncludeImages: Boolean read FOcrIncludeImages write SetOcrIncludeImages;
+    // OCR 4 (jun 23/2026): cada pagina retorna un array 'blocks' con bounding
+    // boxes a nivel de parrafo y etiquetas estructurales (title, table, code...)
+    property OcrIncludeBlocks: Boolean read FOcrIncludeBlocks write FOcrIncludeBlocks default False;
+    // Voxtral TTS: slug de voz del catalogo GET /v1/audio/voices (OBLIGATORIO
+    // para el API; probadas: en_paul_neutral/happy/sad..., gb_oliver_neutral,
+    // gb_jane_sarcasm). El modelo es multilingue con cualquier voz
+    property TtsVoice: string read FTtsVoice write FTtsVoice;
+    // Formato de salida del TTS: mp3 (default) | wav | pcm | flac | opus
+    property TtsFormat: string read FTtsFormat write FTtsFormat;
     property DocumentImageLimit: integer read FDocumentImageLimit write SetDocumentImageLimit;
     property DocumentPageLimit: integer read FDocumentPageLimit write SetDocumentPageLimit;
 
@@ -244,6 +258,9 @@ begin
   LUrl := Url + 'files/' + aMediaFile.IDFile + '/url';
   LHeaders := [TNetHeader.Create('Authorization', 'Bearer ' + ApiKey)]; // A?adir el Header de autorizaci?n
   LResponse := FClient.Get(LUrl, nil, LHeaders); // A?adir el header a la petici?n
+
+  if not Assigned(LResponse) then
+    raise Exception.CreateFmt('Connection failed: no response from %s', [LUrl]);
 
   if LResponse.StatusCode = 200 then
   begin
@@ -371,6 +388,9 @@ begin
 
   LUrl := Url + 'files/' + aFileId;
   LResponse := FClient.Get(LUrl);
+
+  if not Assigned(LResponse) then
+    raise Exception.CreateFmt('Connection failed: no response from %s', [LUrl]);
 
   if LResponse.StatusCode = 200 then
   begin
@@ -548,7 +568,141 @@ begin
   ApiKey := '@MISTRAL_API_KEY';
   Model := 'mistral-small-latest';
   FOcrIncludeImages := True;
+  FOcrIncludeBlocks := False;
+  FTtsVoice := 'en_paul_neutral'; // el API exige una voz; slug probado runtime
+  FTtsFormat := 'mp3';
   Url := GlAIUrl;
+end;
+
+// Voxtral TTS (mar 2026): genera voz desde texto via POST /v1/audio/speech.
+// Se activa con el gap [cap_GenAudio] (p.ej. modelo voxtral-mini-tts-2603).
+// La respuesta puede llegar como bytes de audio crudos o como JSON con el
+// campo audio_data en base64 — se manejan ambas formas.
+function TAiMistralChat.InternalRunNativeSpeechGeneration(ResMsg, AskMsg: TAiChatMessage): String;
+var
+  LUrl, LModel: string;
+  LBodyStream: TStringStream;
+  LResponseStream: TMemoryStream;
+  LHeaders: TNetHeaders;
+  LResponse: IHTTPResponse;
+  LJsonObject: TJSONObject;
+  LErrorResponse: string;
+  LNewAudioFile: TAiMediaFile;
+  OldAsc: Boolean;
+begin
+  Result := '';
+  FBusy := True;
+  FLastError := '';
+  FLastContent := '';
+  FLastPrompt := AskMsg.Prompt;
+
+  if FMessages.IndexOf(AskMsg) < 0 then
+  begin
+    AskMsg.Id := FMessages.Count + 1;
+    FMessages.Add(AskMsg);
+    if Assigned(FOnAddMessage) then
+      FOnAddMessage(Self, AskMsg, Nil, AskMsg.Role, AskMsg.Prompt);
+  end;
+
+  LUrl := Url + 'audio/speech';
+  LModel := TAiChatFactory.Instance.GetBaseModel(GetDriverName, Model);
+  if LModel.IsEmpty then
+    LModel := 'voxtral-mini-tts-2603';
+
+  LJsonObject := TJSONObject.Create;
+  LBodyStream := nil;
+  LResponseStream := TMemoryStream.Create;
+  OldAsc := FClient.Asynchronous;
+  try
+    try
+      FClient.Asynchronous := False;
+
+      LJsonObject.AddPair('model', LModel);
+      LJsonObject.AddPair('input', AskMsg.Prompt);
+      // El API exige 'voice' (slug del catalogo) o 'ref_audio' — sin uno de
+      // los dos devuelve 400
+      LJsonObject.AddPair('voice', FTtsVoice);
+      if FTtsFormat <> '' then
+        LJsonObject.AddPair('response_format', FTtsFormat);
+
+      LBodyStream := TStringStream.Create(LJsonObject.ToJSON, TEncoding.UTF8);
+      LHeaders := [TNetHeader.Create('Authorization', 'Bearer ' + ApiKey)];
+      FClient.ContentType := 'application/json';
+      LBodyStream.Position := 0;
+
+      LResponse := FClient.Post(LUrl, LBodyStream, LResponseStream, LHeaders);
+
+      if LResponse.StatusCode = 200 then
+      begin
+        LNewAudioFile := TAiMediaFile.Create;
+        try
+          LResponseStream.Position := 0;
+          if Pos('json', LResponse.MimeType.ToLower) > 0 then
+          begin
+            // Respuesta JSON: {"audio_data":"<base64>", ...}
+            var LRespBytes: TBytes;
+            SetLength(LRespBytes, LResponseStream.Size);
+            if LResponseStream.Size > 0 then
+              LResponseStream.ReadBuffer(LRespBytes[0], LResponseStream.Size);
+            var LJsonResp := TJSONObject.ParseJSONValue(
+              TEncoding.UTF8.GetString(LRespBytes)) as TJSONObject;
+            if not Assigned(LJsonResp) then
+              raise Exception.Create('Respuesta TTS JSON no valida');
+            try
+              var LB64 := LJsonResp.GetValue<string>('audio_data', '');
+              if LB64 = '' then
+                raise Exception.Create('Respuesta TTS sin audio_data');
+              var LAudioBytes := TNetEncoding.Base64.DecodeStringToBytes(LB64);
+              var LAudioStream := TMemoryStream.Create;
+              try
+                LAudioStream.WriteBuffer(LAudioBytes[0], Length(LAudioBytes));
+                LAudioStream.Position := 0;
+                LNewAudioFile.LoadFromStream('generated_audio.' + FTtsFormat, LAudioStream);
+              finally
+                LAudioStream.Free;
+              end;
+            finally
+              LJsonResp.Free;
+            end;
+          end
+          else
+            // Respuesta binaria: los bytes son el audio directamente
+            LNewAudioFile.LoadFromStream('generated_audio.' + FTtsFormat, LResponseStream);
+
+          ResMsg.MediaFiles.Add(LNewAudioFile);
+          DoStateChange(acsFinished, 'Done');
+          if Assigned(FOnReceiveDataEnd) then
+            FOnReceiveDataEnd(Self, ResMsg, nil, 'model', '');
+        except
+          LNewAudioFile.Free;
+          raise;
+        end;
+      end
+      else
+      begin
+        LResponseStream.Position := 0;
+        var LErrBytes: TBytes;
+        SetLength(LErrBytes, LResponseStream.Size);
+        if LResponseStream.Size > 0 then
+          LResponseStream.ReadBuffer(LErrBytes[0], LResponseStream.Size);
+        LErrorResponse := TEncoding.UTF8.GetString(LErrBytes);
+        FLastError := Format('Error generando audio: %d, %s', [LResponse.StatusCode, LErrorResponse]);
+        DoError(FLastError, nil);
+      end;
+    except
+      on E: Exception do
+      begin
+        FLastError := 'Error en TTS Voxtral: ' + E.Message;
+        DoError(FLastError, E);
+      end;
+    end;
+  finally
+    FClient.Asynchronous := OldAsc;
+    LJsonObject.Free;
+    LBodyStream.Free;
+    LResponseStream.Free;
+    FBusy := False;
+  end;
 end;
 
 function TAiMistralChat.ExtractToolCallFromJson(jChoices: TJSonArray): TAiToolsFunctions;
@@ -800,23 +954,20 @@ begin
 
     if FResponse_format = tiaChatRfJsonSchema then
     begin
+      // ParseJsonSchemaProperty acepta el schema puro o el wrapper {name, strict,
+      // schema} y falla con error claro si JsonSchema esta vacio.
+      var sSchemaName := 'json_response';
+      var bStrict := True;
+      var JInnerSchema := ParseJsonSchemaProperty(sSchemaName, bStrict);
+
+      var JSchemaObj := TJSONObject.Create;
+      JSchemaObj.AddPair('name', sSchemaName);
+      JSchemaObj.AddPair('schema', JInnerSchema);
+      JSchemaObj.AddPair('strict', TJSONBool.Create(bStrict));
+
       var JFormatConfig := TJSONObject.Create;
       JFormatConfig.AddPair('type', 'json_schema');
-      var sSchema := Trim(JsonSchema.Text);
-      if sSchema <> '' then
-      begin
-        var JSchemaObj := TJSONObject.Create;
-        var JInnerSchema := TJSONObject.ParseJSONValue(sSchema) as TJSONObject;
-        if Assigned(JInnerSchema) then
-        begin
-          JSchemaObj.AddPair('name', 'json_response');
-          JSchemaObj.AddPair('schema', JInnerSchema);
-          JSchemaObj.AddPair('strict', TJSONBool.Create(True));
-          JFormatConfig.AddPair('json_schema', JSchemaObj);
-        end
-        else
-          JSchemaObj.Free;
-      end;
+      JFormatConfig.AddPair('json_schema', JSchemaObj);
       AJSONObject.AddPair('response_format', JFormatConfig);
     end
     else if FResponse_format = tiaChatRfJson then
@@ -837,9 +988,21 @@ begin
     FClient.Asynchronous := Self.Asynchronous;
     AJSONObject.AddPair('stream', TJSONBool.Create(FClient.Asynchronous));
 
-    // Si el ThinkingLevel esta activo, usar prompt_mode reasoning para Magistral
+    // Razonamiento: Magistral usa prompt_mode=reasoning; Small4/Medium3.5 usan reasoning_effort
     if ModelConfig.ThinkingLevel <> tlDefault then
-      AJSONObject.AddPair('prompt_mode', 'reasoning');
+    begin
+      if LModel.StartsWith('magistral') then
+        AJSONObject.AddPair('prompt_mode', 'reasoning')
+      else
+      begin
+        // mistral-small-2603 (Small 4) y mistral-medium-2604 (Medium 3.5)
+        case ModelConfig.ThinkingLevel of
+          tlLow:    AJSONObject.AddPair('reasoning_effort', 'low');
+          tlMedium: AJSONObject.AddPair('reasoning_effort', 'medium');
+          tlHigh:   AJSONObject.AddPair('reasoning_effort', 'high');
+        end;
+      end;
+    end;
 
     // 7. --- Finalizaci?n y Devoluci?n del JSON ---
 
@@ -1083,6 +1246,10 @@ begin
     // Par?metros Opcionales
     LJsonObject.AddPair('include_image_base64', TJSONBool.Create(FOcrIncludeImages));
 
+    // OCR 4: bloques estructurales con bounding boxes por pagina
+    if FOcrIncludeBlocks then
+      LJsonObject.AddPair('include_blocks', TJSONBool.Create(True));
+
     // Pages
     LPagesArray := TJSonArray.Create;
     try
@@ -1153,7 +1320,6 @@ begin
 {$ENDIF}
     // 4. Procesar la respuesta
     LResponseStream.Position := 0;
-    ResMsg.Content := LResponse.ContentAsString;
     if LResponse.StatusCode = 200 then
     begin
       LResponseObj := TJSONObject.ParseJSONValue(LResponse.ContentAsString) as TJSONObject;
@@ -1349,7 +1515,7 @@ begin
   LModel := TAiChatFactory.Instance.GetBaseModel(GetDriverName, Model);
 
   Client := TNetHTTPClient.Create(Nil);
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 34}
   Client.SynchronizeEvents := False;
 {$ENDIF}
   LResponseStream := TMemoryStream.Create;

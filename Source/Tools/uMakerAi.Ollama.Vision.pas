@@ -1,4 +1,4 @@
-﻿// IT License
+﻿// MIT License
 //
 // Copyright (c) <year> <copyright holders>
 //
@@ -44,7 +44,7 @@
 //   - Modelo por defecto: gemma3:4b
 //
 // Uso:
-//   AiChat.VisionTool := TAiOllamaVisionTool.Create(Self);
+//   AiChat.ChatTools.VisionTool := TAiOllamaVisionTool.Create(Self);
 //   (TAiOllamaVisionTool(AiChat.VisionTool)).Model := 'llava:latest';
 // -------------------------------------------------------------------------
 
@@ -223,7 +223,7 @@ begin
         else
           LContent := LResponseJson.GetValue<string>('response', '');
 
-        ResMsg.Content := LContent;
+        ResMsg.Prompt := LContent;
         ResMsg.Role := 'assistant';
         ResMsg.Model := FModel;
 

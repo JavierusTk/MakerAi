@@ -1,18 +1,18 @@
-﻿// IT License
+﻿// MIT License
 //
 // Copyright (c) <year> <copyright holders>
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
-// o use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
 //
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
 //
-// HE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
@@ -92,6 +92,7 @@ type
     FRerankModel: string; // Propiedad para el modelo de Rerank
 
     FStreamBuffer: string; // Buffer para acumular datos del stream SSE
+    FStreamThinking: string; // Acumula deltas de thinking (a-plus/north/a-reasoning)
     FStreamLastRole: string; // Para guardar el rol ('assistant') recibido en message-start
     FStreamResponseMsg: TAiChatMessage; // Para acumular los datos finales (usage, etc.)
     FStreamingToolCalls: TDictionary<string, TAiToolsFunction>; // Para construir tool calls en streaming
@@ -288,7 +289,17 @@ begin
 
       _CreateTask(ToolCall, I); // subrutina local garantiza captura por valor
     end;
-    TTask.WaitForAll(TaskList);
+    // Bombear Synchronize/Queue mientras se espera, para no colgar la app si un
+    // tool call accede a la VCL/FMX via TThread.Synchronize (issue #103).
+    // OJO: CheckSynchronize SOLO es valido en el hilo principal; en hilos
+    // secundarios (workers Indy de un servicio headless, TTask de agentes)
+    // LANZA excepcion "CheckSynchronize called from thread X". Fuera del main
+    // thread solo esperamos. Mismo criterio que TMCPClientSSE.WaitForInitialization.
+    while not TTask.WaitForAll(TaskList, 10) do
+      if TThread.CurrentThread.ThreadID = MainThreadID then
+        CheckSynchronize(0)
+      else
+        TThread.Sleep(10);
 
     // 2. Agregar un mensaje 'tool' por cada resultado (formato v2: tool_call_id + content)
     for ToolCall in ToolCallList do
@@ -299,8 +310,19 @@ begin
       ToolCall.MediaFiles.OwnsObjects := False;
     end;
 
-    // 3. Volver a llamar a Run para obtener la respuesta final
-    Self.Run(nil, nil);
+    // 3. Volver a llamar a Run para obtener la respuesta final.
+    // ISSUE #100: en async este método se invoca desde el callback de recepción
+    // (OnInternalReceiveData -> ProcessStreamBuffer -> message-end). Reentrar con
+    // Self.Run inicia un POST nuevo cuyo finally libera el FCurrentPostStream de la
+    // petición en vuelo -> AV en THTTPClient.ExecuteHTTPInternal. Se difiere a
+    // OnRequestCompletedEvent (base), que corre cuando la petición ya liberó su stream.
+    if FClient.Asynchronous then
+      FPendingToolRun := True
+    else
+      // Reutilizar el MISMO ResMsg del round 1 (patron de la base, linea Run(Nil,
+      // ResMsg)): el texto final del round 2 queda en ResMsg.Prompt, que es lo que
+      // RunNew retorna al llamador sincrono. Con nil el resultado llegaba vacio.
+      Self.Run(nil, ResMsg);
 
   finally
     ToolCallList.Free;
@@ -337,6 +359,7 @@ var
   LUri: TURI;
 begin
   Result := TStringList.Create;
+  try // ISSUE #114: si el cuerpo lanza, liberar Result para no fugarlo
   Client := TNetHTTPClient.Create(nil);
   ResponseStream := TStringStream.Create('', TEncoding.UTF8);
   try
@@ -356,6 +379,9 @@ begin
 
     // Se pasa el par?metro AHeaders a la llamada GET.
     HttpResponse := Client.Get(FullUrl, ResponseStream, Headers);
+
+    if not Assigned(HttpResponse) then
+      raise Exception.CreateFmt('Connection failed: no response from %s', [FullUrl]);
 
     // 4. Procesar la respuesta (sin cambios)
     if HttpResponse.StatusCode = 200 then
@@ -389,6 +415,10 @@ begin
   finally
     Client.Free;
     ResponseStream.Free;
+  end;
+  except // ISSUE #114: el camino de error no debe dejar huerfano el Result
+    Result.Free;
+    raise;
   end;
 end;
 
@@ -432,6 +462,29 @@ begin
     if Self.Seed > 0 then
       LJsonObject.AddPair('seed', TJSONNumber.Create(Self.Seed));
 
+    // --- Thinking (ago 2026) ---
+    // command-a-plus, north-mini-* y command-a-reasoning razonan POR DEFECTO
+    // (bloques content type='thinking'). cap_Reasoning lo activa explicitamente;
+    // sin el cap se envia disabled para modo rapido, EXCEPTO command-a-plus que
+    // siempre razona (con disabled el API falla con INVALID_TOOL_GENERATION).
+    if ContainsText(Self.Model, '-reasoning-') or StartsText('command-a-plus', Self.Model) or
+       StartsText('north-', Self.Model) then
+    begin
+      var jThinking := TJSonObject.Create;
+      if cap_Reasoning in ModelConfig.ModelCaps then
+      begin
+        jThinking.AddPair('type', 'enabled');
+        LJsonObject.AddPair('thinking', jThinking);
+      end
+      else if not StartsText('command-a-plus', Self.Model) then
+      begin
+        jThinking.AddPair('type', 'disabled');
+        LJsonObject.AddPair('thinking', jThinking);
+      end
+      else
+        jThinking.Free;
+    end;
+
     // --- 2. CONSTRUCCI?N DEL HISTORIAL DE MENSAJES ('messages') ---
     LMessagesArray := TJSONArray.Create;
     for LMessage in Self.Messages do
@@ -452,9 +505,12 @@ begin
             LToolCallsValue.Free;
           LMsgObj.AddPair('tool_calls', TJSONArray.Create);
         end;
-        // Cohere permite un 'content' con 'thinking' junto a 'tool_calls'
-        if not LMessage.Prompt.IsEmpty then
-          LMsgObj.AddPair('content', LMessage.Prompt);
+        // La API v2 de Cohere RECHAZA content de tipo 'text' junto a 'tool_calls'
+        // ("messages with non-empty 'tool_calls' cannot contain content items of type
+        // 'text'"). En streaming el modelo suele emitir un preámbulo de texto antes del
+        // tool_call que queda en LMessage.Prompt; ese texto NO debe enviarse en el
+        // mensaje assistant que porta los tool_calls. Se omite el content de texto.
+        // (Solo se admitiría content de tipo 'thinking', que aquí no emitimos.)
 
       end
       else if (LRoleStr = 'tool') then
@@ -600,6 +656,9 @@ begin
 
     Res := FClient.Post(sUrl, St, FResponse, Headers);
 
+    if not Assigned(Res) then
+      raise Exception.CreateFmt('Connection failed: no response from %s', [sUrl]);
+
     FResponse.Position := 0;
     FLastContent := '';
 
@@ -651,6 +710,7 @@ begin
   if AAbort then
   begin
     FBusy := False;
+    FPendingToolRun := False;
     if Assigned(FOnReceiveDataEnd) then
       FOnReceiveDataEnd(Self, nil, nil, 'system', 'abort');
     Exit;
@@ -658,7 +718,15 @@ begin
 
   // 1. Acumular los datos recibidos en nuestro buffer.
   // FResponse es el TStringStream de la clase base.
-  FStreamBuffer := FStreamBuffer + FResponse.DataString;
+  // ISSUE #124: decodificar ANTES de limpiar; si el chunk termina en un caracter
+  // UTF-8 incompleto, DataString lanza EEncodingError, se sale sin hacer Clear y
+  // el proximo chunk completa el caracter.
+  try
+    FStreamBuffer := FStreamBuffer + FResponse.DataString;
+  except
+    on EEncodingError do
+      Exit;
+  end;
   FResponse.Clear;
   FResponse.Position := 0;
 
@@ -732,6 +800,13 @@ begin
           var LText: string;
           if (jContentValue as TJSonObject).TryGetValue<string>('text', LText) then
             LResponseText := LResponseText + LText;
+        end
+        else if LContentType = 'thinking' then
+        begin
+          // a-plus/north/a-reasoning: razonamiento previo al texto
+          var LThink: string;
+          if (jContentValue as TJSonObject).TryGetValue<string>('thinking', LThink) then
+            ResMsg.ReasoningContent := ResMsg.ReasoningContent + LThink;
         end;
       end;
     end;
@@ -808,12 +883,13 @@ begin
 
       if LFuncionesList.Count > 0 then
       begin
-        ResMsg.Content := LResponseText;
         ResMsg.Prompt := LResponseText;
         ResMsg.Tool_calls := jToolCalls.ToJSon;
 
         InternalAddMessage(ResMsg);
-        ExecuteAndRespondToToolCalls(LFuncionesList, nil);
+        // Pasar ResMsg (no nil): el round 2 sincrono lo reutiliza y el texto
+        // final queda en ResMsg.Prompt (valor de retorno de AddMessageAndRun)
+        ExecuteAndRespondToToolCalls(LFuncionesList, ResMsg);
         Exit;
       end;
     finally
@@ -825,7 +901,6 @@ begin
 
   // --- 4. Respuesta normal ---
   Self.FLastContent := LResponseText;
-  ResMsg.Content := LResponseText;
   ResMsg.Prompt := LResponseText;
 
   FBusy := False;
@@ -881,6 +956,7 @@ begin
         if LType = 'message-start' then
         begin
           FLastContent := '';
+          FStreamThinking := '';
           FStreamingToolCalls.Clear;
           FStreamingToolCallsByIndex.Clear;
           FStreamingCitations.Clear;
@@ -898,7 +974,17 @@ begin
             begin
               var jContent: TJSonObject;
               if jDeltaMessage.TryGetValue<TJSonObject>('content', jContent) then
+              begin
                 jContent.TryGetValue<string>('text', TextChunk);
+                // Deltas de thinking (a-plus/north/a-reasoning)
+                var ThinkChunk: string := '';
+                if jContent.TryGetValue<string>('thinking', ThinkChunk) and (ThinkChunk <> '') then
+                begin
+                  FStreamThinking := FStreamThinking + ThinkChunk;
+                  if Assigned(OnReceiveThinking) then
+                    OnReceiveThinking(Self, nil, JsonData, FStreamLastRole, ThinkChunk);
+                end;
+              end;
             end;
           end;
 
@@ -1029,6 +1115,8 @@ begin
         begin
           FStreamResponseMsg := TAiChatMessage.Create(FLastContent, FStreamLastRole);
           try
+            if FStreamThinking <> '' then
+              FStreamResponseMsg.ReasoningContent := FStreamThinking;
             FStreamResponseMsg.Citations.Assign(FStreamingCitations);
 
             // Usage del evento final
@@ -1096,11 +1184,15 @@ begin
               end;
             end;
 
-            FBusy := False;
+            // ISSUE #100: si hay continuación tool-calling diferida (FPendingToolRun),
+            // el turno sigue activo: no liberar FBusy (lo gestiona el siguiente Run).
+            if not FPendingToolRun then
+              FBusy := False;
           except
             if Assigned(FStreamResponseMsg) then
               FStreamResponseMsg.Free;
             FStreamResponseMsg := nil;
+            FPendingToolRun := False;
             raise;
           end;
         end;
@@ -1253,7 +1345,7 @@ begin
   LModel := TAiChatFactory.Instance.GetBaseModel(GetDriverName, Model);
 
   Client := TNetHTTPClient.Create(Nil);
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 34}
   Client.SynchronizeEvents := False;
 {$ENDIF}
   LResponseStream := TMemoryStream.Create;

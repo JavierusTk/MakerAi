@@ -7,7 +7,7 @@
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
-// o use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
 //
@@ -40,7 +40,7 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.Threading, System.Generics.Collections, System.IOUtils,
-  System.NetEncoding, System.Net.URLClient, System.Net.HttpClient, System.StrUtils,
+  System.NetEncoding, System.Net.URLClient, System.Net.HttpClient, System.StrUtils, System.Math,
   System.Net.Mime, System.Net.HttpClientComponent, System.JSON, Rest.JSON,
 {$IF CompilerVersion < 35}
   uJSONHelper,
@@ -82,6 +82,15 @@ type
     FAllowAutoShell: Boolean;
     FReasoningSummary: TAiReasoningSummary;
     FRecursionNeeded: Boolean;
+    // Mensaje 'assistant' donde se va acumulando el texto del stream. Se
+    // fija en 'response.created' porque al cerrar el turno el ultimo
+    // mensaje del historial puede NO ser este (p.ej. un computer_call
+    // crudo delegado), y volcar ahi FLastContent lo destruiria.
+    FStreamTextMsg: TAiChatMessage;
+    // Ultimo effort que se le mando al servidor en ESTA conversacion. Sirve
+    // para decidir si hay que emitir un 'configuration_update' en vez de
+    // cambiar el reasoning a nivel de peticion, que rompe el prefijo cacheado.
+    FLastEffortSent: TAiThinkingLevel;
 
     procedure SetStore(const Value: Boolean);
     procedure SetTruncation(const Value: String);
@@ -145,6 +154,16 @@ uses
 Const
   GlOpenAIUrl = 'https://api.openai.com/v1/';
 
+// reasoning.effort que se envia. La familia GPT-6 acepta none/low/medium/
+// high/xhigh/max pero NO minimal (la 5.x si): ahi tlMinimal se pide como
+// low para no provocar un 400.
+function OpenAiEffort(const AModel: string; ALevel: TAiThinkingLevel): string;
+begin
+  Result := ThinkingLevelToStr(ALevel);
+  if (ALevel = tlMinimal) and AModel.ToLower.StartsWith('gpt-6') then
+    Result := 'low';
+end;
+
 procedure Register;
 begin
   RegisterComponents('MakerAI', [TAiOpenChat]);
@@ -162,13 +181,17 @@ begin
   FVerbosity := '';
   FResponseId := '';
   FResponseStatus := '';
+  FLastEffortSent := tlDefault;
   // URL y ApiKey por defecto
   if ApiKey = '' then
     ApiKey := '@OPENAI_API_KEY';
   if Url = '' then
     Url := GlOpenAIUrl;
-  if Model = '' then
-    Model := 'gpt-5.1';
+  // gpt-6-sol desde v3.8: sucesor de gpt-5.1 en la misma franja de precio
+  // ($2/$10). Se asigna SIEMPRE: el constructor de TAiChat deja 'gpt-5', asi
+  // que el antiguo "if Model = ''" nunca se cumplia y un TAiOpenChat creado
+  // directamente usaba gpt-5 (que se apaga el 11 dic 2026), no gpt-5.1.
+  Model := 'gpt-6-sol';
 
   FReasoningSummary := rsmDefault;
   // Capacidades configuradas via Initializations.pas (ModelConfig.ModelCaps/SessionCaps)
@@ -266,7 +289,7 @@ class procedure TAiOpenChat.RegisterDefaultParams(Params: TStrings);
 begin
   Params.Clear;
   Params.Add('ApiKey=@OPENAI_API_KEY');
-  Params.Add('Model=gpt-5.1');
+  Params.Add('Model=gpt-6-sol');
   Params.Add('Url=https://api.openai.com/v1/');
 end;
 
@@ -465,6 +488,8 @@ var
   StartIndex: Integer; // Variable nueva para control de historial
   LastMsg: TAiChatMessage;
   IsToolLoop: Boolean;
+  LEffortAsConfigUpdate: Boolean; // el effort viaja como item, no a nivel de peticion
+  JConfigUpd: TJSonObject;
 
   // Helper local (SIN CAMBIOS con respecto a la ?ltima correcci?n)
   procedure AddMessageToInput(Msg: TAiChatMessage; TargetArray: TJSonArray);
@@ -479,11 +504,11 @@ var
     ExtraFileRefs: String;
     IsSpecialAssistant: Boolean;
   begin
-    IsSpecialAssistant := (Msg.Role = 'assistant') and Msg.Prompt.Trim.StartsWith('{') and (ContainsText(Msg.Prompt, '"type":"shell_call"') or ContainsText(Msg.Prompt, '"type":"apply_patch_call"'));
+    IsSpecialAssistant := (Msg.Role = 'assistant') and Msg.Prompt.Trim.StartsWith('{') and (ContainsText(Msg.Prompt, '"type":"shell_call"') or ContainsText(Msg.Prompt, '"type":"apply_patch_call"') or ContainsText(Msg.Prompt, '"type":"computer_call"'));
 
     if (Msg.Role = 'tool') or IsSpecialAssistant then
     begin
-      if Msg.Prompt.Trim.StartsWith('{') and (ContainsText(Msg.Prompt, '"type":"apply_patch_call_output"') or ContainsText(Msg.Prompt, '"type":"shell_call_output"') or ContainsText(Msg.Prompt, '"type":"shell_call"') or
+      if Msg.Prompt.Trim.StartsWith('{') and (ContainsText(Msg.Prompt, '"type":"apply_patch_call_output"') or ContainsText(Msg.Prompt, '"type":"computer_call_output"') or ContainsText(Msg.Prompt, '"type":"computer_call"') or ContainsText(Msg.Prompt, '"type":"shell_call_output"') or ContainsText(Msg.Prompt, '"type":"shell_call"') or
         ContainsText(Msg.Prompt, '"type":"apply_patch_call"')) then
       begin
         JPreBuilt := TJSonObject.ParseJSONValue(Msg.Prompt) as TJSonObject;
@@ -552,8 +577,51 @@ var
 
     if Msg.Role = 'assistant' then
     begin
-      JUserObj.AddPair('content', Msg.Prompt);
-      TargetArray.Add(JUserObj);
+      // Solo agregar el mensaje de texto si trae contenido (un assistant que
+      // únicamente hizo tool_calls llega con Prompt vacío).
+      if Msg.Prompt.Trim <> '' then
+      begin
+        JUserObj.AddPair('content', Msg.Prompt);
+        TargetArray.Add(JUserObj);
+      end
+      else
+        JUserObj.Free;
+
+      // Historial pass-through de function calling (formato chat-completions:
+      // assistant.tool_calls + mensajes role='tool'). La Responses API exige un
+      // item function_call por cada llamada, con el mismo call_id que después
+      // referencia el function_call_output — sin esto Azure/OpenAI rechazan el
+      // request con "No tool call found for function call output".
+      if Msg.Tool_calls <> '' then
+      begin
+        var JTCParsed := TJSonObject.ParseJSONValue(Msg.Tool_calls);
+        try
+          if JTCParsed is TJSonArray then
+            for var JTCItem in TJSonArray(JTCParsed) do
+              if JTCItem is TJSonObject then
+              begin
+                var JTC := TJSonObject(JTCItem);
+                var JFunc: TJSonObject := nil;
+                JTC.TryGetValue<TJSonObject>('function', JFunc);
+                var JCall := TJSonObject.Create;
+                JCall.AddPair('type', 'function_call');
+                JCall.AddPair('call_id', JTC.GetValue<string>('id', ''));
+                if Assigned(JFunc) then
+                begin
+                  JCall.AddPair('name', JFunc.GetValue<string>('name', ''));
+                  JCall.AddPair('arguments', JFunc.GetValue<string>('arguments', '{}'));
+                end
+                else
+                begin
+                  JCall.AddPair('name', JTC.GetValue<string>('name', ''));
+                  JCall.AddPair('arguments', JTC.GetValue<string>('arguments', '{}'));
+                end;
+                TargetArray.Add(JCall);
+              end;
+        finally
+          JTCParsed.Free;
+        end;
+      end;
       Exit;
     end;
 
@@ -671,6 +739,7 @@ begin
     // -------------------------------------------------------------------------
     JInputArray := TJSonArray.Create;
     StartIndex := 0;
+    LEffortAsConfigUpdate := False;
 
     // Verificamos si tenemos un ID de respuesta del turno anterior v?lido.
     // Esto permite usar el cache/contexto del servidor y evitar reenviar historial.
@@ -714,6 +783,33 @@ begin
       end;
     end;
 
+    // -------------------------------------------------------------------------
+    // 2b. CAMBIO DE REASONING EFFORT A MITAD DE CONVERSACION
+    // -------------------------------------------------------------------------
+    // Cambiar 'reasoning.effort' a nivel de peticion altera el prefijo de la
+    // conversacion y tira el prompt caching entero. El item
+    // 'configuration_update' existe justamente para eso: aplica desde aqui en
+    // adelante (hasta que otro lo sustituya) sin tocar el prefijo.
+    //
+    // Solo se emite cuando: (a) continuamos una conversacion viva, (b) el
+    // effort es distinto del ultimo que mandamos y (c) el modelo lo entiende.
+    // El gate (c) es por familia y a proposito: un 'configuration_update'
+    // contra gpt-5.x devuelve 400. Si se da de alta una familia posterior,
+    // hay que anadirla aqui.
+    if (FResponseId <> '') and
+       (ModelConfig.ThinkingLevel <> FLastEffortSent) and
+       (ThinkingLevelToStr(ModelConfig.ThinkingLevel) <> '') and
+       LModel.ToLower.StartsWith('gpt-6') then
+    begin
+      JConfigUpd := TJSonObject.Create;
+      JConfigUpd.AddPair('type', 'configuration_update');
+      JConfigUpd.AddPair('reasoning',
+        TJSonObject.Create(TJSONPair.Create('effort', OpenAiEffort(LModel, ModelConfig.ThinkingLevel))));
+      JInputArray.Add(JConfigUpd);
+      LEffortAsConfigUpdate := True;
+    end;
+    FLastEffortSent := ModelConfig.ThinkingLevel;
+
     // Recorremos desde el punto calculado (0 si es nuevo, >0 si es continuaci?n)
     for I := StartIndex to FMessages.Count - 1 do
     begin
@@ -730,20 +826,32 @@ begin
 
     // 3. Par?metros de Configuraci?n
     JResult.AddPair('store', FStore);
+
+    // Tope de salida. El Responses API lo llama max_output_tokens (e INCLUYE
+    // los tokens de razonamiento). Hasta 2026-09-30 este driver no lo emitia
+    // nunca y el Max_tokens del componente se ignoraba en silencio: un cliente
+    // pidiendo max_tokens=200 recibia miles de tokens. Solo se emite con valor
+    // explicito (>0): el comportamiento historico era "sin tope", y emitir el
+    // default 3000 del componente cortaria a los razonadores a mitad de cadena
+    // -- quien no quiera tope debe poner Max_tokens en 0.
+    if Max_tokens > 0 then
+      JResult.AddPair('max_output_tokens',
+        TJSONNumber.Create(System.Math.Max(Max_tokens, 16)));
     if FTruncation <> 'disabled' then
       JResult.AddPair('truncation', FTruncation);
 
-    if (ModelConfig.ThinkingLevel <> tlDefault) or (FReasoningSummary <> rsmDefault) then
+    // El effort va a nivel de peticion SALVO que estemos continuando una
+    // conversacion y haya CAMBIADO: en ese caso viaja como item
+    // 'configuration_update' dentro del input (ver mas arriba), que es lo que
+    // permite subirlo o bajarlo sin invalidar el prefijo cacheado.
+    if (not LEffortAsConfigUpdate) and
+       ((ModelConfig.ThinkingLevel <> tlDefault) or (FReasoningSummary <> rsmDefault)) then
     begin
       JReasoning := TJSonObject.Create;
-      Case ModelConfig.ThinkingLevel of
-        tlLow:
-          JReasoning.AddPair('effort', 'low');
-        tlMedium:
-          JReasoning.AddPair('effort', 'medium');
-        tlHigh:
-          JReasoning.AddPair('effort', 'high');
-      End;
+      // Escalera completa: none / minimal / low / medium / high / xhigh / max.
+      // ThinkingLevelToStr devuelve '' para tlDefault, que es "no mandes nada".
+      if ThinkingLevelToStr(ModelConfig.ThinkingLevel) <> '' then
+        JReasoning.AddPair('effort', OpenAiEffort(LModel, ModelConfig.ThinkingLevel));
       case FReasoningSummary of
         rsmAuto:
           JReasoning.AddPair('summary', 'auto');
@@ -769,66 +877,64 @@ begin
 JFormatConfig := Nil;
     if FResponse_format = tiaChatRfJsonSchema then
     begin
-      JFormatConfig := TJSonObject.Create;
-      JFormatConfig.AddPair('type', 'json_schema');
+      // El Responses API exige name+schema al mismo nivel que type en text.format
+      // (estructura aplanada, NO sub-objeto json_schema) — sin ellos el request
+      // falla con 400. JsonSchema acepta el schema puro o el wrapper completo
+      // {name, strict, schema}.
+      var sSchemaName := 'structured_response';
+      var bStrict := True;
+      var JInnerSchema := ParseJsonSchemaProperty(sSchemaName, bStrict);
 
-      if JsonSchema.Text <> '' then
+      // A. VALIDACI?N TIPO OBJECT (solo en modo strict, que exige
+      // additionalProperties=false y todas las propiedades en 'required')
+      var sSchemaType := '';
+      if bStrict and JInnerSchema.TryGetValue<string>('type', sSchemaType) and (sSchemaType = 'object') then
       begin
-        // Limpieza b?sica de saltos de l?nea para evitar errores de parseo
-        var sShema := StringReplace(JsonSchema.Text, '\n', ' ', [rfReplaceAll]);
+         // 1. CORRECCI?N: additionalProperties: false es obligatorio
+         if JInnerSchema.GetValue('additionalProperties') = nil then
+           JInnerSchema.AddPair('additionalProperties', TJSONBool.Create(False));
 
-        var JInnerSchema := TJSonObject.ParseJSONValue(sShema) as TJSonObject;
+         // 2. CORRECCI?N: OpenAI Strict exige que TODAS las propiedades est?n en 'required'
+         var JProps: TJSONObject;
+         if JInnerSchema.TryGetValue<TJSONObject>('properties', JProps) then
+         begin
+           var JReq: TJSonArray;
+           // Obtener o crear array 'required'
+           if not JInnerSchema.TryGetValue<TJSonArray>('required', JReq) then
+           begin
+             JReq := TJSonArray.Create;
+             JInnerSchema.AddPair('required', JReq);
+           end;
 
-        if Assigned(JInnerSchema) then
-        begin
-          // A. VALIDACI?N TIPO OBJECT
-          if JInnerSchema.GetValue<string>('type') = 'object' then
-          begin
-             // 1. CORRECCI?N: additionalProperties: false es obligatorio
-             if JInnerSchema.GetValue('additionalProperties') = nil then
-               JInnerSchema.AddPair('additionalProperties', TJSONBool.Create(False));
+           // Recorrer todas las propiedades y asegurarse que est?n en 'required'
+           for var I1 := 0 to JProps.Count - 1 do
+           begin
+             var PropName := JProps.Pairs[I1].JsonString.Value;
+             var Found := False;
 
-             // 2. CORRECCI?N: OpenAI Strict exige que TODAS las propiedades est?n en 'required'
-             var JProps: TJSONObject;
-             if JInnerSchema.TryGetValue<TJSONObject>('properties', JProps) then
+             for var K := 0 to JReq.Count - 1 do
              begin
-               var JReq: TJSonArray;
-               // Obtener o crear array 'required'
-               if not JInnerSchema.TryGetValue<TJSonArray>('required', JReq) then
+               if JReq.Items[K].Value = PropName then
                begin
-                 JReq := TJSonArray.Create;
-                 JInnerSchema.AddPair('required', JReq);
-               end;
-
-               // Recorrer todas las propiedades y asegurarse que est?n en 'required'
-               for var I1 := 0 to JProps.Count - 1 do
-               begin
-                 var PropName := JProps.Pairs[I1].JsonString.Value;
-                 var Found := False;
-
-                 for var K := 0 to JReq.Count - 1 do
-                 begin
-                   if JReq.Items[K].Value = PropName then
-                   begin
-                     Found := True;
-                     Break;
-                   end;
-                 end;
-
-                 // Si falta, lo agregamos para satisfacer a la API
-                 if not Found then
-                   JReq.Add(PropName);
+                 Found := True;
+                 Break;
                end;
              end;
-          end;
 
-          // B. CONFIGURACI?N FINAL (Flattened structure para Responses API)
-          // Estos par?metros van al mismo nivel que "type", NO dentro de un sub-objeto json_schema
-          JFormatConfig.AddPair('name', 'structured_response');
-          JFormatConfig.AddPair('strict', TJSONBool.Create(True));
-          JFormatConfig.AddPair('schema', JInnerSchema);
-        end;
+             // Si falta, lo agregamos para satisfacer a la API
+             if not Found then
+               JReq.Add(PropName);
+           end;
+         end;
       end;
+
+      // B. CONFIGURACI?N FINAL (Flattened structure para Responses API)
+      // Estos par?metros van al mismo nivel que "type", NO dentro de un sub-objeto json_schema
+      JFormatConfig := TJSonObject.Create;
+      JFormatConfig.AddPair('type', 'json_schema');
+      JFormatConfig.AddPair('name', sSchemaName);
+      JFormatConfig.AddPair('strict', TJSONBool.Create(bStrict));
+      JFormatConfig.AddPair('schema', JInnerSchema);
     end
     // 2. Configurar JSON Simple (Para cuando no es Schema estricto)
     else if FResponse_format = tiaChatRfJson then
@@ -865,7 +971,19 @@ JFormatConfig := Nil;
 
     // ---- 4. TOOLS -----------------------------------------
     if Tool_Active and Assigned(AiFunctions) then
+    begin
       JToolsArray := GetTools(AiFunctions);
+
+      // 'async' solo lo entiende gpt-6-astra en adelante. El formateador de
+      // Responses es el MISMO para toda la familia OpenAi, asi que sin esta
+      // poda una tool declarada async contra un gpt-5.x se iria con un campo
+      // que ese modelo rechaza. Se limpia aqui, que es el unico punto donde se
+      // conoce el modelo de destino. Anadir aqui las familias posteriores.
+      if Assigned(JToolsArray) and (not LModel.ToLower.StartsWith('gpt-6')) then
+        for var LTIdx := 0 to JToolsArray.Count - 1 do
+          if JToolsArray.Items[LTIdx] is TJSonObject then
+            TJSonObject(JToolsArray.Items[LTIdx]).RemovePair('async').Free;
+    end;
 
     if (cap_Shell in ModelConfig.ModelCaps) then
     begin
@@ -875,6 +993,23 @@ JFormatConfig := Nil;
       JShellTool := TJSonObject.Create;
       JShellTool.AddPair('type', 'shell');
       JToolsArray.Add(JShellTool);
+    end;
+
+    if (cap_ComputerUse in ModelConfig.ModelCaps) then
+    begin
+      if not Assigned(JToolsArray) then
+        JToolsArray := TJSonArray.Create;
+      // Tool 'computer' (gpt-6-astra, ago 2026). NO lleva parametros: ni
+      // display_width/display_height ni environment (el API responde
+      // "Unknown parameter"). El modelo deduce las dimensiones del propio
+      // screenshot, asi que ScreenWidth/ScreenHeight del TAiComputerUseTool
+      // solo se usan en local para normalizar las coordenadas de vuelta.
+      // Sustituye a computer_use_preview, cuyo modelo dedicado se apago el
+      // 23-jul-2026 y que astra ya rechaza.
+      var
+      JComputerTool := TJSonObject.Create;
+      JComputerTool.AddPair('type', 'computer');
+      JToolsArray.Add(JComputerTool);
     end;
 
     if (cap_GenImage in ModelConfig.ModelCaps) then
@@ -1023,6 +1158,11 @@ var
   NewMsg: TAiChatMessage;
   GeneratedFile: TAiMediaFile;
   WebItem: TAiWebSearchItem;
+  // Computer Use: astra suele emitir texto de comentario JUNTO con el
+  // computer_call (phase='commentary'), asi que FLastContent no queda vacio y
+  // la condicion normal de recursion no dispararia. Esta bandera fuerza el
+  // siguiente ciclo para que la IA vea el screenshot resultante.
+  LComputerCallDone: Boolean;
   // Variables auxiliares para valores num?ricos
   UnixDate: Int64;
   TokenCount: Int64;
@@ -1094,21 +1234,70 @@ begin
   // D) USO DE TOKENS (Costos, Cach? y Razonamiento)
   if jObj.TryGetValue<TJSonObject>('usage', JUsage) then
   begin
+    var LPrompt: Int64 := 0;
+    var LCompletion: Int64 := 0;
+    var LTotal: Int64 := 0;
+    var LCached: Int64 := 0;
+    var LCacheWrite: Int64 := 0;
+
     // Totales b?sicos
     if JUsage.TryGetValue<Int64>('input_tokens', TokenCount) then
+    begin
       ResMsg.Prompt_tokens := TokenCount;
+      LPrompt := TokenCount;
+    end;
 
     if JUsage.TryGetValue<Int64>('output_tokens', TokenCount) then
+    begin
       ResMsg.Completion_tokens := TokenCount;
+      LCompletion := TokenCount;
+    end;
 
     if JUsage.TryGetValue<Int64>('total_tokens', TokenCount) then
+    begin
       ResMsg.Total_tokens := TokenCount;
+      LTotal := TokenCount;
+    end;
 
     // Detalles de Entrada: Tokens en Cach? (Ahorro)
     if JUsage.TryGetValue<TJSonObject>('input_tokens_details', JInputDetails) then
     begin
       if JInputDetails.TryGetValue<Int64>('cached_tokens', TokenCount) then
+      begin
         ResMsg.cached_tokens := TokenCount;
+        LCached := TokenCount;
+      end;
+
+      // Escritura de cache. Hasta GPT-5.5 era gratis y la Responses API no la
+      // reportaba; desde GPT-5.6 cuesta 1.25x la entrada y llega en este mismo
+      // objeto como 'cache_write_tokens'. Sin leerlo, quien factura ve cero
+      // escrituras siempre y ese gasto no se cobra ni se registra.
+      if JInputDetails.TryGetValue<Int64>('cache_write_tokens', TokenCount) then
+      begin
+        ResMsg.Cache_write_tokens := TokenCount;
+        LCacheWrite := TokenCount;
+      end;
+    end;
+
+    // Los tres contadores se dejan DISJUNTOS antes de salir de aqui.
+    //
+    // En la Responses API 'input_tokens' INCLUYE los cacheados y los de
+    // escritura (medido contra la API: input_tokens 7613 = 3 nuevos + 7610 de
+    // cache_write). Anthropic los reporta separados y TAiClaudeChat los expone
+    // asi, de modo que quien factura SUMA los tres. Dejarlos solapados hace que
+    // los tokens cacheados se cobren dos veces: una a tarifa de entrada
+    // completa y otra a tarifa de cache.
+    //
+    // La resta solo se aplica si de verdad estan contenidos (prompt >= cache).
+    // Si un proveedor ya los diera separados, la condicion no se cumple y no se
+    // toca nada: la correccion no puede volverse en contra.
+    if (LCached + LCacheWrite) > 0 then
+    begin
+      if LPrompt >= (LCached + LCacheWrite) then
+      begin
+        LPrompt := LPrompt - LCached - LCacheWrite;
+        ResMsg.Prompt_tokens := LPrompt;
+      end;
     end;
 
     // Detalles de Salida: Tokens de Razonamiento (Thinking)
@@ -1117,6 +1306,18 @@ begin
       if JUsageDetails.TryGetValue<Int64>('reasoning_tokens', TokenCount) then
         ResMsg.Thinking_tokens := TokenCount;
     end;
+
+    // Contadores del COMPONENTE. Este override solo alimentaba ResMsg, y quien
+    // lee los tokens del componente (Prompt_tokens) recibia 0 con cualquier
+    // modelo servido por este driver. La clase base (uMakerAi.Chat.pas, ParseChat)
+    // y TAiClaudeChat.ParseChat si los acumulan; aqui faltaba.
+    // Se ACUMULAN por ronda, como en esos dos, para que un bucle de tool calling
+    // no pierda las rondas intermedias.
+    Self.Prompt_tokens := Self.Prompt_tokens + Integer(LPrompt);
+    Self.Completion_tokens := Self.Completion_tokens + Integer(LCompletion);
+    Self.Total_tokens := Self.Total_tokens + Integer(LTotal);
+    Self.Cached_tokens := Self.Cached_tokens + Integer(LCached);
+    Self.Cache_write_tokens := Self.Cache_write_tokens + Integer(LCacheWrite);
   end;
 
   // ---------------------------------------------------------------------------
@@ -1127,6 +1328,8 @@ begin
   ToolCalls := TObjectList<TAiToolsFunction>.Create;
 
   try
+    LComputerCallDone := False;
+
     // 2. Iterar el array 'output' (Polimorfismo: Messages, Tools, Images)
     if jObj.TryGetValue<TJSonArray>('output', JOutput) then
     begin
@@ -1284,6 +1487,9 @@ begin
             ToolCall.Name := SVal;
           if JItem.TryGetValue<String>('arguments', SVal) then
             ToolCall.Arguments := SVal;
+          // Marca de tool asincrona: el turno NO se bloquea esperando este
+          // resultado, que puede entregarse despues con el mismo call_id.
+          ToolCall.IsAsync := JItem.GetValue<Boolean>('async', False);
 
           ToolCalls.Add(ToolCall);
         end
@@ -1424,6 +1630,164 @@ begin
           end;
         end
 
+        // --- TIPO: COMPUTER CALL (CONTROL DE PANTALLA) ---
+        // gpt-6-astra manda un LOTE: un unico computer_call con un array 'actions'
+        // (p.ej. keypress[WIN,r] + type 'notepad' + keypress[ENTER]). Se ejecutan en
+        // orden y se responde con UN solo computer_call_output por call_id, con el
+        // screenshot final: el API exige exactamente un output por llamada.
+        else if SType = 'computer_call' then
+        begin
+          if JItem.TryGetValue<String>('call_id', SCallId) then
+          begin
+            // 1. Guardar el call crudo en el historial (cadena User -> Call -> Output)
+            var
+            HistCU := TAiChatMessage.Create(JItem.ToString, 'assistant');
+            HistCU.ToolCallId := SCallId;
+            HistCU.PreviousResponseId := FResponseId;
+            HistCU.Id := Self.Messages.Count + 1;
+            Self.Messages.Add(HistCU);
+
+            var
+              LShot: TAiMediaFile;
+            var
+              LDelegated: Boolean;
+            LShot := nil;
+            // Lote delegado: nadie lo ejecuta en este proceso. O porque el
+            // interceptor lo reclamo, o porque no hay con que hacerlo aqui.
+            LDelegated := False;
+            try
+              // 2. Ejecutar TODAS las acciones del lote, en orden
+              var
+                JActions: TJSonArray;
+              if not Assigned(ChatTools.ComputerUseTool) then
+              begin
+                // cap_ComputerUse declara el tool al modelo, asi que el modelo
+                // lo va a usar: sin el componente no hay ejecutor ni captura, y
+                // un computer_call_output sin image_url es un 400 seguro. Se deja
+                // el call crudo en el historial y se corta el turno, avisando,
+                // porque esto es configuracion incompleta: en OpenAI el unico
+                // punto de intercepcion (OnCallToolFunction) vive DENTRO del
+                // recorrido de 'actions', que necesita el componente.
+                LDelegated := True;
+                FLastError := 'computer_call ' + SCallId +
+                  ': cap_ComputerUse esta activo pero ChatTools.ComputerUseTool no '
+                  + 'esta asignado. El turno se corta sin responder al modelo.';
+                DoError(FLastError, nil);
+              end
+              else if not JItem.TryGetValue<TJSonArray>('actions', JActions) then
+              begin
+                // Forma inesperada del item: astra manda siempre un array
+                // 'actions', aunque el lote sea de una sola accion.
+                LDelegated := True;
+                FLastError := 'computer_call ' + SCallId +
+                  ': el item no trae el array "actions" esperado.';
+                DoError(FLastError, nil);
+              end
+              else
+              begin
+                for var Ai := 0 to JActions.Count - 1 do
+                begin
+                  var
+                  JAct := JActions.Items[Ai] as TJSonObject;
+                  var
+                  LCU := TAiToolsFunction.Create;
+                  try
+                    LCU.Id := SCallId;
+                    LCU.Name := JAct.GetValue<string>('type', '');
+                    LCU.Arguments := JAct.ToJSON;
+                    ChatTools.ComputerUseTool.TranslateOpenAIToolCall(LCU);
+
+                    if Assigned(FOnCallToolFunction) then
+                      FOnCallToolFunction(Self, LCU);
+
+                    // Mismo contrato que Claude y que el bridge generico de
+                    // TAiChat: si el interceptor lleno Response, no se ejecuta
+                    // en local. Aqui la delegacion es ATOMICA sobre el lote
+                    // completo: un computer_call es una unidad con un unico
+                    // computer_call_output, y repartir sus acciones entre un
+                    // ejecutor local y uno remoto dejaria el screenshot final
+                    // sin dueño. La primera accion reclamada entrega el resto.
+                    if LCU.Response <> '' then
+                    begin
+                      LDelegated := True;
+                      Break;
+                    end;
+
+                    // Solo interesa la foto posterior a la ULTIMA accion: las
+                    // intermedias se descartan para no inflar tokens ni latencia.
+                    FreeAndNil(LShot);
+                    ChatTools.ComputerUseTool.ProcessToolCall(LCU, LShot);
+                  finally
+                    LCU.Free;
+                  end;
+                end;
+
+                // Si el lote no dejo screenshot (accion fallida o denegada por
+                // seguridad), se fuerza uno: el output NO admite quedarse sin
+                // imagen (el API pide exactamente uno de image_url o file_id),
+                // y ademas el modelo necesita ver el estado resultante.
+                if (not LDelegated) and (not Assigned(LShot)) then
+                begin
+                  var
+                  LSnap := TAiToolsFunction.Create;
+                  try
+                    LSnap.Id := SCallId;
+                    LSnap.Name := 'screenshot';
+                    LSnap.Arguments := '{}';
+                    ChatTools.ComputerUseTool.ProcessToolCall(LSnap, LShot);
+                  finally
+                    LSnap.Free;
+                  end;
+                end;
+              end;
+
+              // 3. Devolver un unico computer_call_output con la imagen final.
+              //    Si el lote se delego no se responde nada y no se marca
+              //    LComputerCallDone: sin output que enviar, recurrir solo
+              //    conseguiria que el modelo reciba dos veces el mismo call.
+              if (not LDelegated) and (not Assigned(LShot)) then
+              begin
+                // El output exige exactamente una imagen (image_url o
+                // file_id). Sin screenshot -- normalmente porque el
+                // TAiComputerUseTool no tiene OnExecuteAction /
+                // OnRequestScreenshot asignados -- enviarlo es un 400
+                // seguro, asi que se corta el turno dejando constancia.
+                FLastError := 'computer_call ' + SCallId +
+                  ': no se pudo capturar la pantalla. Revise OnExecuteAction '
+                  + 'y OnRequestScreenshot del TAiComputerUseTool.';
+                DoError(FLastError, nil);
+              end
+              else if not LDelegated then
+              begin
+                LComputerCallDone := True;
+
+                var
+                JCUOut := TJSonObject.Create;
+                try
+                  JCUOut.AddPair('type', 'computer_call_output');
+                  JCUOut.AddPair('call_id', SCallId);
+                  var
+                  JShotObj := TJSonObject.Create;
+                  JShotObj.AddPair('type', 'computer_screenshot');
+                  if Assigned(LShot) then
+                    JShotObj.AddPair('image_url', 'data:' + LShot.MimeType + ';base64,' + LShot.Base64);
+                  JCUOut.AddPair('output', JShotObj);
+
+                  NewMsg := TAiChatMessage.Create(JCUOut.ToString, 'tool');
+                  NewMsg.ToolCallId := SCallId;
+                  NewMsg.PreviousResponseId := FResponseId;
+                  NewMsg.Id := Self.Messages.Count + 1;
+                  Self.Messages.Add(NewMsg);
+                finally
+                  JCUOut.Free;
+                end;
+              end;
+            finally
+              FreeAndNil(LShot);
+            end;
+          end;
+        end
+
         // --- TIPO: APPLY PATCH (EDICI?N DE ARCHIVOS) ---
         else if SType = 'apply_patch_call' then
         begin
@@ -1533,7 +1897,6 @@ begin
 
     // 3. Finalizar procesamiento del mensaje de texto
     ResMsg.Prompt := FLastContent;
-    ResMsg.Content := FLastContent;
     ResMsg.PreviousResponseId := FResponseId;
 
     // 4. Ejecutar Tools est?ndar (Functions) si las hay
@@ -1550,7 +1913,18 @@ begin
         _CreateTask(ToolCall, I); // subrutina local garantiza captura por valor
       end;
 
-      TTask.WaitForAll(TaskList);
+      // Bombear Synchronize/Queue mientras se espera, para no colgar la app si un
+      // tool call accede a la VCL/FMX via TThread.Synchronize (issue #103).
+      // OJO: CheckSynchronize SOLO es valido en el hilo principal; en hilos
+      // secundarios (p.ej. workers Indy de un servicio headless) LANZA excepcion
+      // "CheckSynchronize called from thread X". Fuera del main thread solo
+      // esperamos (los tool calls que tocan UI ya no aplican). Mismo criterio que
+      // TMCPClientSSE.WaitForInitialization.
+      while not TTask.WaitForAll(TaskList, 10) do
+        if TThread.CurrentThread.ThreadID = MainThreadID then
+          CheckSynchronize(0)
+        else
+          Sleep(10);
 
       // Crear mensajes de respuesta de tools
       for I := 0 to ToolCalls.Count - 1 do
@@ -1575,7 +1949,10 @@ begin
       // Si no hubo Function Calls, revisamos si hubo Shell Calls o Patch Calls que agregaron mensajes
       // al historial. Si es as?, debemos hacer recursi?n para que la IA vea el resultado.
       // (Verificamos si el ?ltimo mensaje es de tipo 'tool')
-      if (Self.Messages.Count > 0) and (Self.Messages.Last.Role = 'tool') and (FLastContent = '') then
+      // El computer_call va aparte: se recurre aunque haya texto, porque el
+      // modelo comenta cada paso mientras sigue conduciendo la pantalla.
+      if (Self.Messages.Count > 0) and (Self.Messages.Last.Role = 'tool') and
+         ((FLastContent = '') or LComputerCallDone) then
       begin
         // Recursi?n para que la IA responda al resultado del shell/patch
         Self.Run(Nil, ResMsg);
@@ -1638,6 +2015,7 @@ begin
   FAbort := False;
   FLastError := '';
   FResponseStatus := '';
+  FLastContent := ''; // limpia el acumulado del turno anterior (streaming lee delta a delta)
 
   // 1. Asegurar que el mensaje del USUARIO est? en el historial
   if FMessages.IndexOf(AskMsg) < 0 then
@@ -1669,6 +2047,9 @@ begin
 
     FResponse.Clear;
     Res := FClient.Post(sUrl, St, FResponse, FHeaders);
+
+    if not Assigned(Res) then
+      raise Exception.CreateFmt('Connection failed: no response from %s', [sUrl]);
 
     if FClient.Asynchronous = False then
     begin
@@ -1923,7 +2304,6 @@ begin
                 begin
                   CaptureResMsg.MediaFiles.Add(VideoMedia);
                   CaptureResMsg.Prompt := Format('Video generated successfully.', []);
-                  CaptureResMsg.Content := CaptureResMsg.Prompt;
 
                   DoStateChange(acsFinished, 'Video Ready');
                   if Assigned(FOnReceiveDataEnd) then
@@ -2125,7 +2505,7 @@ end;
 
 function TAiOpenChat.InternalRunNativeImageGeneration(ResMsg, AskMsg: TAiChatMessage): String;
 var
-  LUrl, LModel, LQuality, LSize, LStyle: string;
+  LUrl, LModel, LQuality, LSize, LValue: string;
   LBodyJson: TJSonObject;
   LBodyStream: TStringStream;
   LResponseStream: TStringStream;
@@ -2190,24 +2570,41 @@ begin
 
     LBodyJson.AddPair('model', LModel);
     LBodyJson.AddPair('prompt', AskMsg.Prompt);
-    LBodyJson.AddPair('n', TJSONNumber.Create(N));
+    LBodyJson.AddPair('n', TJSONNumber.Create(Max(1, N)));
 
-    // gpt-image-1 y gpt-image-2 no aceptan response_format (siempre devuelven b64_json)
-    if (LModel = 'dall-e-2') or (LModel = 'dall-e-3') then
-      LBodyJson.AddPair('response_format', 'b64_json');
+    // 'response_format' y 'style' fueron RETIRADOS de la API de OpenAI (2026),
+    // tambien para dall-e-2/3: enviarlos produce 400 "Unknown parameter"
+    // (verificado contra api.openai.com jul-2026). La API decide el formato:
+    // la familia gpt-image devuelve b64_json; el parsing de abajo cubre
+    // ademas 'url' por compatibilidad con endpoints OpenAI-compatible.
 
     LBodyJson.AddPair('size', LSize);
 
-    // dall-e-2 no acepta quality ni style
+    // dall-e-2 no acepta quality
     if (LModel <> 'dall-e-2') then
       LBodyJson.AddPair('quality', LQuality);
 
-    // dall-e-3 acepta style
-    if LModel = 'dall-e-3' then
+    // Passthrough de los parámetros exclusivos de la familia gpt-image
+    // (background, output_format, output_compression, moderation). Sirve
+    // sobre todo para gpt-image-2.5-flare/sunburst, que sí devuelven fondo
+    // transparente con canal alpha real -> requiere output_format png/webp.
+    if LModel.StartsWith('gpt-image') or LModel.StartsWith('chatgpt-image') then
     begin
-      LStyle := ImageParams.Params.Values['style'];
-      if LStyle = '' then LStyle := 'vivid';
-      LBodyJson.AddPair('style', LStyle);
+      LValue := ImageParams.Params.Values['background'];
+      if LValue <> '' then
+        LBodyJson.AddPair('background', LValue);
+
+      LValue := ImageParams.Params.Values['output_format'];
+      if LValue <> '' then
+        LBodyJson.AddPair('output_format', LValue);
+
+      LValue := ImageParams.Params.Values['output_compression'];
+      if LValue <> '' then
+        LBodyJson.AddPair('output_compression', TJSONNumber.Create(StrToIntDef(LValue, 100)));
+
+      LValue := ImageParams.Params.Values['moderation'];
+      if LValue <> '' then
+        LBodyJson.AddPair('moderation', LValue);
     end;
 
     if not User.IsEmpty then
@@ -2255,6 +2652,25 @@ begin
             except
               LNewImageFile.Free;
               raise;
+            end;
+          end
+          else
+          begin
+            // Sin response_format la API puede responder con 'url' (endpoints
+            // OpenAI-compatible / dall-e legado): descargar la imagen
+            var LImgUrl := '';
+            LImageObject.TryGetValue<string>('url', LImgUrl);
+            if LImgUrl <> '' then
+            begin
+              LNewImageFile := TAiMediaFile.Create;
+              try
+                LNewImageFile.LoadFromUrl(LImgUrl);
+                LNewImageFile.Transcription := LRevisedPrompt;
+                ResMsg.MediaFiles.Add(LNewImageFile);
+              except
+                LNewImageFile.Free;
+                raise;
+              end;
             end;
           end;
         end;
@@ -2309,7 +2725,7 @@ begin
   LModel := TAiChatFactory.Instance.GetBaseModel(GetDriverName, Model);
 
   Client := TNetHTTPClient.Create(Nil);
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 34}
   Client.SynchronizeEvents := False;
 {$ENDIF}
   LResponseStream := TMemoryStream.Create;
@@ -2407,6 +2823,8 @@ procedure TAiOpenChat.NewChat;
 begin
   // TODO: DeleteAllUploadedFiles desactivado — OpenAI no persiste archivos entre sesiones
   FResponseId := ''; // Inicia una nueva conversación
+  FLastEffortSent := tlDefault; // el effort no se hereda de la conversacion anterior
+  FStreamTextMsg := nil;       // el historial se vacia en inherited
   inherited;
 end;
 
@@ -2432,12 +2850,20 @@ begin
     Exit;
 
   LogDebug('--OnInternalReceiveData--');
-  LogDebug(FResponse.DataString);
+  // ISSUE #124: el log no debe abortar el stream si el chunk termina en un
+  // caracter UTF-8 incompleto (ver acumulacion protegida mas abajo).
+  try
+    LogDebug(FResponse.DataString);
+  except
+    on EEncodingError do
+      LogDebug('[chunk UTF-8 parcial - log omitido]');
+  end;
 
   AAbort := FAbort;
   if FAbort then
   begin
     FBusy := False;
+    FPendingToolRun := False;
     FTmpToolCallBuffer.Clear;
     DoStateChange(acsAborted, 'Aborted');
     if Assigned(FOnReceiveDataEnd) then
@@ -2448,19 +2874,27 @@ begin
   // ---------------------------------------------------------------------------
   // 1. Acumulaci?n Robusta (UTF-8)
   // ---------------------------------------------------------------------------
-  if FResponse is TStringStream then
-  begin
-    SS := TStringStream(FResponse);
-    if SS.Size > 0 then
+  // ISSUE #124: decodificar ANTES de limpiar. Si el chunk termina en un caracter
+  // UTF-8 incompleto, GetString/DataString lanzan EEncodingError: se sale sin hacer
+  // Clear, los bytes quedan en FResponse y el proximo chunk completa el caracter.
+  try
+    if FResponse is TStringStream then
     begin
-      SetLength(BytesBuffer, SS.Size);
-      SS.Position := 0;
-      SS.Read(BytesBuffer, 0, SS.Size);
-      FTmpResponseText := FTmpResponseText + TEncoding.UTF8.GetString(BytesBuffer);
-    end;
-  end
-  else
-    FTmpResponseText := FTmpResponseText + FResponse.DataString;
+      SS := TStringStream(FResponse);
+      if SS.Size > 0 then
+      begin
+        SetLength(BytesBuffer, SS.Size);
+        SS.Position := 0;
+        SS.Read(BytesBuffer, 0, SS.Size);
+        FTmpResponseText := FTmpResponseText + TEncoding.UTF8.GetString(BytesBuffer);
+      end;
+    end
+    else
+      FTmpResponseText := FTmpResponseText + FResponse.DataString;
+  except
+    on EEncodingError do
+      Exit;
+  end;
 
   FResponse.Clear;
 
@@ -2519,7 +2953,10 @@ begin
             NewStreamMsg.PreviousResponseId := FResponseId;
             FMessages.Add(NewStreamMsg);
             // Ahora GetLastMessage apuntar? a este nuevo mensaje limpio
-          end;
+            FStreamTextMsg := NewStreamMsg;
+          end
+          else
+            FStreamTextMsg := LastM;
           // ------------------------------------------------------------------
 
           FRecursionNeeded := False;
@@ -2565,6 +3002,10 @@ begin
                 BufferTool.AddPair('name', FuncName);
                 BufferTool.AddPair('arguments', '');
               end;
+              // La marca async viaja en el item, no en los deltas: hay que
+              // guardarla ya, porque al cerrar el item se lee del buffer.
+              if JItem.GetValue<Boolean>('async', False) then
+                BufferTool.AddPair('async', TJSONBool.Create(True));
               FTmpToolCallBuffer.AddOrSetValue(OutputIndex, BufferTool);
             end
             else if ItemType = 'reasoning' then
@@ -2610,7 +3051,21 @@ begin
               ToolCall.Id := BufferTool.GetValue<string>('call_id');
               ToolCall.Name := ToolName;
               ToolCall.Arguments := BufferTool.GetValue<string>('arguments');
+              ToolCall.IsAsync := BufferTool.GetValue<Boolean>('async', False)
+                                  or JItem.GetValue<Boolean>('async', False);
               FTmpToolCallBuffer.Remove(OutputIndex); // doOwnsValues libera BufferTool automáticamente
+
+              // Paridad con la via sincrona (ParseChat): pasar ResMsg/AskMsg al
+              // handler. ResMsg = mensaje assistant en construccion (creado en
+              // response.created); AskMsg = ultimo mensaje del usuario. Sin esto
+              // ToolCall.ResMsg llegaba nil en modo streaming.
+              ToolCall.ResMsg := GetLastMessage;
+              for var LIdx := FMessages.Count - 1 downto 0 do
+                if FMessages[LIdx].Role = 'user' then
+                begin
+                  ToolCall.AskMsg := FMessages[LIdx];
+                  Break;
+                end;
 
               DoCallFunction(ToolCall);
 
@@ -2665,6 +3120,144 @@ begin
                     FMessages.Add(ResultMsg);
                     FRecursionNeeded := True;
                   end;
+                end;
+              end;
+            end
+
+            // 2b. Computer Call (control de pantalla)
+            // Mismo contrato que en el camino sincrono: un computer_call trae un
+            // ARRAY 'actions' que se ejecuta en orden, y se responde con UN unico
+            // computer_call_output con el screenshot final.
+            else if (ItemType = 'computer_call') then
+            begin
+              if JItem.TryGetValue<String>('call_id', CallId) then
+              begin
+                // Historial: el call crudo como mensaje del assistant
+                var
+                CUCallMsg := TAiChatMessage.Create(JItem.ToString, 'assistant');
+                CUCallMsg.ToolCallId := CallId;
+                CUCallMsg.PreviousResponseId := FResponseId;
+                CUCallMsg.Id := FMessages.Count + 1;
+                FMessages.Add(CUCallMsg);
+
+                var
+                  LShotS: TAiMediaFile;
+                var
+                  LDelegatedS: Boolean;
+                LShotS := nil;
+                // Lote delegado: no se ejecuta en este proceso (ver el detalle
+                // del contrato en el camino sincrono).
+                LDelegatedS := False;
+                try
+                  var
+                    JActionsS: TJSonArray;
+                  if not Assigned(ChatTools.ComputerUseTool) then
+                  begin
+                    // Ver el camino sincrono: sin componente no hay ejecutor ni
+                    // captura, y tampoco punto de intercepcion.
+                    LDelegatedS := True;
+                    FLastError := 'computer_call ' + CallId +
+                      ': cap_ComputerUse esta activo pero ChatTools.ComputerUseTool '
+                      + 'no esta asignado. El turno se corta sin responder al modelo.';
+                    DoError(FLastError, nil);
+                  end
+                  else if not JItem.TryGetValue<TJSonArray>('actions', JActionsS) then
+                  begin
+                    LDelegatedS := True;
+                    FLastError := 'computer_call ' + CallId +
+                      ': el item no trae el array "actions" esperado.';
+                    DoError(FLastError, nil);
+                  end
+                  else
+                  begin
+                    for var Ai := 0 to JActionsS.Count - 1 do
+                    begin
+                      var
+                      JActS := JActionsS.Items[Ai] as TJSonObject;
+                      var
+                      LCUS := TAiToolsFunction.Create;
+                      try
+                        LCUS.Id := CallId;
+                        LCUS.Name := JActS.GetValue<string>('type', '');
+                        LCUS.Arguments := JActS.ToJSON;
+                        ChatTools.ComputerUseTool.TranslateOpenAIToolCall(LCUS);
+
+                        if Assigned(FOnCallToolFunction) then
+                          FOnCallToolFunction(Self, LCUS);
+
+                        // Si el interceptor lleno Response, el lote ENTERO se
+                        // da por delegado: un computer_call tiene un unico
+                        // output y no se puede repartir entre dos ejecutores.
+                        if LCUS.Response <> '' then
+                        begin
+                          LDelegatedS := True;
+                          Break;
+                        end;
+
+                        // Solo se conserva la foto de la ULTIMA accion del lote.
+                        FreeAndNil(LShotS);
+                        ChatTools.ComputerUseTool.ProcessToolCall(LCUS, LShotS);
+                      finally
+                        LCUS.Free;
+                      end;
+                    end;
+
+                    // El output exige imagen (uno de image_url o file_id): si el
+                    // lote no dejo ninguna, se fuerza una captura.
+                    if (not LDelegatedS) and (not Assigned(LShotS)) then
+                    begin
+                      var
+                      LSnapS := TAiToolsFunction.Create;
+                      try
+                        LSnapS.Id := CallId;
+                        LSnapS.Name := 'screenshot';
+                        LSnapS.Arguments := '{}';
+                        ChatTools.ComputerUseTool.ProcessToolCall(LSnapS, LShotS);
+                      finally
+                        LSnapS.Free;
+                      end;
+                    end;
+                  end;
+
+                  // Si el lote se delego no se emite output ni se pide
+                  // recursion: no hay nada que devolverle al modelo todavia.
+                  if (not LDelegatedS) and (not Assigned(LShotS)) then
+                  begin
+                    // Ver el camino sincrono: un computer_call_output sin
+                    // imagen es un 400 seguro, mejor cortar el turno.
+                    FLastError := 'computer_call ' + CallId +
+                      ': no se pudo capturar la pantalla. Revise OnExecuteAction '
+                      + 'y OnRequestScreenshot del TAiComputerUseTool.';
+                    DoError(FLastError, nil);
+                  end
+                  else if not LDelegatedS then
+                  begin
+                    var
+                    JCUOutS := TJSonObject.Create;
+                    try
+                      JCUOutS.AddPair('type', 'computer_call_output');
+                      JCUOutS.AddPair('call_id', CallId);
+                      var
+                      JShotS := TJSonObject.Create;
+                      JShotS.AddPair('type', 'computer_screenshot');
+                      if Assigned(LShotS) then
+                        JShotS.AddPair('image_url', 'data:' + LShotS.MimeType + ';base64,' + LShotS.Base64);
+                      JCUOutS.AddPair('output', JShotS);
+
+                      var
+                      CUResMsg := TAiChatMessage.Create(JCUOutS.ToString, 'tool');
+                      CUResMsg.ToolCallId := CallId;
+                      CUResMsg.PreviousResponseId := FResponseId;
+                      CUResMsg.Id := FMessages.Count + 1;
+                      FMessages.Add(CUResMsg);
+                    finally
+                      JCUOutS.Free;
+                    end;
+
+                    FRecursionNeeded := True;
+                  end;
+                finally
+                  FreeAndNil(LShotS);
                 end;
               end;
             end
@@ -2766,24 +3359,21 @@ begin
         // ---------------------------------------------------------------------
         // F) FINALIZACI?N (METADATOS DE COSTOS, EXTRACTION Y RECURSI?N)
         // ---------------------------------------------------------------------
-        else if EventType = 'response.completed' then
+        // response.incomplete es el cierre de un stream TRUNCADO (max_output_tokens
+        // o content filter): mismo payload que completed, con incomplete_details.
+        // Hasta 2026-09-30 solo se atendia 'completed' y un stream truncado no
+        // disparaba OnReceiveDataEnd: el consumidor esperaba hasta su timeout.
+        else if (EventType = 'response.completed') or (EventType = 'response.incomplete') then
         begin
           if FRecursionNeeded then
           begin
             DoStateChange(acsConnecting, 'Sending tool results...');
-{$IF CompilerVersion >= 36}
-            TThread.ForceQueue(nil,
-              procedure
-              begin
-                Self.Run(nil, nil);
-              end);
-{$ELSE}
-            TThread.Queue(nil,
-              procedure
-              begin
-                Self.Run(nil, nil);
-              end);
-{$ENDIF}
+            // ISSUE #100: diferir la continuación tool-calling a OnRequestCompletedEvent
+            // (base) en lugar de hacer ForceQueue aquí, DENTRO del callback de recepción.
+            // OnRequestCompletedEvent se ejecuta cuando la petición ya completó por completo
+            // y su FSourceStream/FCurrentPostStream se liberó de forma segura, eliminando la
+            // carrera entre el siguiente POST y el Seek final de THTTPClient.ExecuteHTTPInternal.
+            FPendingToolRun := True;
           end
           else
           begin
@@ -2794,26 +3384,111 @@ begin
             begin
               if JResp.TryGetValue<TJSonObject>('usage', JUsage) then
               begin
+                var LSPrompt: Int64 := 0;
+                var LSCompletion: Int64 := 0;
+                var LSTotal: Int64 := 0;
+                var LSCached: Int64 := 0;
+                var LSCacheWrite: Int64 := 0;
+
                 // Tokens normales (Usando los nombres de tu clase)
                 if JUsage.TryGetValue<Int64>('total_tokens', TokenCount) then
+                begin
                   FinalMsg.Total_tokens := TokenCount;
+                  LSTotal := TokenCount;
+                end;
                 if JUsage.TryGetValue<Int64>('input_tokens', TokenCount) then
+                begin
                   FinalMsg.Prompt_tokens := TokenCount;
+                  LSPrompt := TokenCount;
+                end;
                 if JUsage.TryGetValue<Int64>('output_tokens', TokenCount) then
+                begin
                   FinalMsg.Completion_tokens := TokenCount;
+                  LSCompletion := TokenCount;
+                end;
 
                 // Tokens Cach?
                 if JUsage.TryGetValue<TJSonObject>('input_tokens_details', JInputDetails) then
+                begin
                   if JInputDetails.TryGetValue<Int64>('cached_tokens', TokenCount) then
+                  begin
                     FinalMsg.cached_tokens := TokenCount;
+                    LSCached := TokenCount;
+                  end;
+                  // Escritura de cache (GPT-5.6+). Ver el comentario largo en
+                  // ParseChat: sin esto el gasto de escribir cache no se cobra.
+                  if JInputDetails.TryGetValue<Int64>('cache_write_tokens', TokenCount) then
+                  begin
+                    FinalMsg.Cache_write_tokens := TokenCount;
+                    LSCacheWrite := TokenCount;
+                  end;
+                end;
+
+                // Disjuntos, igual que en ParseChat: 'input_tokens' de la
+                // Responses API incluye los cacheados y los de escritura, y
+                // quien factura suma los tres.
+                if (LSCached + LSCacheWrite) > 0 then
+                begin
+                  if LSPrompt >= (LSCached + LSCacheWrite) then
+                  begin
+                    LSPrompt := LSPrompt - LSCached - LSCacheWrite;
+                    FinalMsg.Prompt_tokens := LSPrompt;
+                  end;
+                end;
 
                 // Tokens Reasoning
                 if JUsage.TryGetValue<TJSonObject>('output_tokens_details', JUsageDetails) then
                   if JUsageDetails.TryGetValue<Int64>('reasoning_tokens', TokenCount) then
                     FinalMsg.Thinking_tokens := TokenCount;
+
+                // Contadores del COMPONENTE, igual que en ParseChat: sin esto, en
+                // streaming el consumo tambien llegaba en cero a quien lo lee.
+                Self.Prompt_tokens := Self.Prompt_tokens + Integer(LSPrompt);
+                Self.Completion_tokens := Self.Completion_tokens + Integer(LSCompletion);
+                Self.Total_tokens := Self.Total_tokens + Integer(LSTotal);
+                Self.Cached_tokens := Self.Cached_tokens + Integer(LSCached);
+                Self.Cache_write_tokens := Self.Cache_write_tokens + Integer(LSCacheWrite);
               end;
               if JResp.TryGetValue<string>('model', DeltaVal) then
                 FinalMsg.Model := DeltaVal;
+              // Motivo del truncado, igual que en el modo sincrono (ParseChat).
+              var JIncStream := JResp.GetValue('incomplete_details');
+              if Assigned(JIncStream) and (JIncStream is TJSonObject) and
+                 TJSonObject(JIncStream).TryGetValue<string>('reason', DeltaVal) then
+                FinalMsg.FinishReason := DeltaVal;
+            end;
+
+            // --- Persistir el texto acumulado en el mensaje (antes solo viajaba
+            // como parámetro del evento OnReceiveDataEnd, sin quedar en Prompt) ---
+            // Se escribe en el mensaje de texto del stream, NO en el ultimo del
+            // historial: si el turno termino con un computer_call delegado, ese
+            // ultimo mensaje lleva el item crudo que el cliente necesita y
+            // volcarle FLastContent (normalmente vacio) lo borraba.
+            if Assigned(FStreamTextMsg) then
+              FStreamTextMsg.Prompt := FLastContent
+            else if Assigned(FinalMsg) then
+              FinalMsg.Prompt := FLastContent;
+
+            // --- Paridad con modo sincrono: consolidar en el mensaje final la
+            // media que los handlers de function calling adjuntaron durante el
+            // turno via ToolCall.ResMsg (mensajes assistant intermedios de las
+            // rondas de tools). Sin esto, aMsg.MediaFiles llegaba vacio al
+            // OnReceiveDataEnd en async. Es seguro: los mensajes assistant
+            // serializan solo texto hacia la API (AddMessageToInput), asi que
+            // mover la media no cambia los requests siguientes. La media de los
+            // mensajes 'tool' NO se toca (esa si se reenvia al modelo). ---
+            if Assigned(FinalMsg) then
+            begin
+              for var LI := FMessages.Count - 1 downto 0 do
+              begin
+                var LPrev := FMessages[LI];
+                if LPrev.Role = 'user' then
+                  Break; // inicio del turno actual
+                if (LPrev = FinalMsg) or (LPrev.Role <> 'assistant') then
+                  Continue;
+                for var LJ := LPrev.MediaFiles.Count - 1 downto 0 do
+                  FinalMsg.AddMediaFile(LPrev.MediaFiles.Extract(LPrev.MediaFiles[LJ]));
+              end;
             end;
 
             // --- Extracci?n de c?digo a archivos (MarkdownCodeExtractor) ---
@@ -2852,8 +3527,26 @@ begin
         end
 
         // --- G) ERRORES ---
-        else if EventType = 'error' then
-          DoStateChange(acsError, JsonEvent.ToString);
+        // response.failed es el cierre de un turno FALLIDO (trae response.error);
+        // 'error' es el fallo suelto del protocolo. Ambos deben terminar por la
+        // via de error de verdad: DoStateChange(acsError) a secas NO dispara
+        // OnError, asi que el consumidor no se enteraba y esperaba su timeout,
+        // el mismo silencio que tenia response.incomplete.
+        else if (EventType = 'error') or (EventType = 'response.failed') then
+        begin
+          FBusy := False;
+          var LErrMsg := '';
+          if (EventType = 'response.failed') and
+             JsonEvent.TryGetValue<TJSonObject>('response', JResp) then
+          begin
+            var JErrV := JResp.GetValue('error');
+            if Assigned(JErrV) and (JErrV is TJSonObject) then
+              TJSonObject(JErrV).TryGetValue<string>('message', LErrMsg);
+          end;
+          if LErrMsg = '' then
+            LErrMsg := JsonEvent.ToString;
+          DoError(LErrMsg, nil);
+        end;
 
       finally
         JsonEvent.Free;

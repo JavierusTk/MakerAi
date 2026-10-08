@@ -166,6 +166,7 @@
         <DCCReference Include="..\Core\uMakerAi.Core.pas"/>
         <DCCReference Include="..\Embeddings\uMakerAi.Embeddings.pas"/>
         <DCCReference Include="..\Core\uMakerAi.Prompts.pas"/>
+        <DCCReference Include="..\Core\uMakerAi.Skills.Format.pas"/>
         <DCCReference Include="..\Core\uMakerAi.Utils.CodeExtractor.pas"/>
         <DCCReference Include="..\Core\uMakerAi.Utils.PcmToWav.pas"/>
         <DCCReference Include="..\Core\uMakerAi.Utils.System.pas"/>
@@ -193,6 +194,8 @@
         <DCCReference Include="..\Chat\uMakerAi.Chat.Kimi.pas"/>
         <DCCReference Include="..\Chat\uMakerAi.Chat.LMStudio.pas"/>
         <DCCReference Include="..\Utils\uMakerAi.Utils.DiffUpdater.pas"/>
+        <DCCReference Include="..\Utils\uMakerAi.Utils.AudioCapture.pas"/>
+        <DCCReference Include="..\Utils\uMakerAi.Utils.AudioPlayback.pas"/>
         <DCCReference Include="..\Chat\uMakerAi.Chat.GenericLLM.pas"/>
         <DCCReference Include="..\Chat\uMakerAi.Chat.MakerAi.pas"/>
         <DCCReference Include="..\MCPServer\UMakerAi.MCPServer.SSE.pas"/>
@@ -220,6 +223,7 @@
         <DCCReference Include="..\Tools\uMakerAi.Gemini.WebSearch.pas"/>
         <DCCReference Include="..\Tools\uMakerAi.OpenAI.WebSearch.pas"/>
         <DCCReference Include="..\Tools\uMakerAi.Tools.Functions.pas"/>
+        <DCCReference Include="..\Tools\uMakerAi.Tools.Skills.pas"/>
         <DCCReference Include="..\Tools\uMakerAi.Tools.Shell.pas"/>
         <DCCReference Include="..\Tools\uMakerAi.Tools.TextEditor.pas"/>
         <DCCReference Include="..\Tools\uMakerAi.OpenAI.Audio.pas"/>
@@ -229,6 +233,7 @@
         <DCCReference Include="..\Tools\uMakerAi.Ollama.Ocr.pas"/>
         <DCCReference Include="..\Tools\uMakerAi.Ollama.Vision.pas"/>
         <DCCReference Include="..\Tools\uMakerAi.Gemini.Speech.pas"/>
+        <DCCReference Include="..\Tools\uMakerAi.ElevenLabs.Speech.pas"/>
         <DCCReference Include="..\WebSocket\uMakerAi.WebSocket.Client.pas"/>
         <DCCReference Include="..\WebSocket\uMakerAi.WebSocket.SChannel.pas"/>
         <DCCReference Include="..\WebSocket\uMakerAi.WebSocket.OpenSSL.pas"/>
@@ -236,8 +241,13 @@
         <DCCReference Include="..\Realtime\uMakerAi.Realtime.WebSocket.pas"/>
         <DCCReference Include="..\Realtime\uMakerAi.Realtime.pas"/>
         <DCCReference Include="..\Realtime\uMakerAi.Realtime.OpenAI.pas"/>
+        <DCCReference Include="..\Realtime\uMakerAi.Realtime.OpenAI.Live.pas"/>
         <DCCReference Include="..\Realtime\uMakerAi.Realtime.Gemini.pas"/>
+        <DCCReference Include="..\Realtime\uMakerAi.Realtime.Grok.pas"/>
         <DCCReference Include="..\Realtime\uMakerAi.Realtime.AiConnection.pas"/>
+        <DCCReference Include="..\Realtime\uMakerAi.Realtime.MakerAi.pas"/>
+        <DCCReference Include="..\Memory\uMakerAi.Memory.Types.pas"/>
+        <DCCReference Include="..\Memory\uMakerAi.Memory.Decay.pas"/>
         <None Include="..\RAG\RagGraph_Prompt_Example.md"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>

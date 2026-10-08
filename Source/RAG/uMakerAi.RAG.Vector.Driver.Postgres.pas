@@ -114,6 +114,8 @@ procedure Register;
 
 implementation
 
+{$R ..\Resources\uMakerAiRAGDriversIcons.res}  // iconos de paleta del paquete
+
 procedure Register;
 begin
   RegisterComponents('MakerAI.RAG.Drivers', [TAiRAGVectorPostgresDriver]);
@@ -788,7 +790,8 @@ begin
 
     // --- BLOQUE COMBINE / RRF / SCORE ---
     SQL.AppendLine('combined AS (');
-    SQL.AppendLine('  SELECT COALESCE(v.id, l.id) as id, COALESCE(v.entidad, l.entidad) as entidad, COALESCE(v.content, l.content) as content, COALESCE(v.model, l.model) as model, COALESCE(v.properties, l.properties) as properties, COALESCE(v.embedding, l.embedding) as embedding,');
+    SQL.AppendLine('  SELECT COALESCE(v.id, l.id) as id, COALESCE(v.entidad, l.entidad) as entidad, COALESCE(v.content, l.content) as content, COALESCE(v.model, l.model) as model, ' +
+      'COALESCE(v.properties, l.properties) as properties, COALESCE(v.embedding, l.embedding) as embedding,');
     SQL.AppendLine('    COALESCE(v.v_score, 0) as v_score, COALESCE(l.l_score, 0) as l_score, COALESCE(v.v_rank, 999999) as v_rank, COALESCE(l.l_rank, 999999) as l_rank');
     SQL.AppendLine('  FROM vector_res v FULL OUTER JOIN lexical_res l ON v.id = l.id');
     SQL.AppendLine('),');
@@ -830,7 +833,13 @@ begin
       SQL.AppendLine('    raw_score as final_score');
     SQL.AppendLine('  FROM scored');
     SQL.AppendLine(')');
-    SQL.AppendLine('SELECT id, entidad, content, model, properties, embedding, final_score');
+    // embedding::text NO es cosmetico: FireDAC mapea el tipo vector de pgvector a
+    // ftBlob y AsString devuelve los bytes crudos, que StringToEmbedding no sabe
+    // leer (acaba produciendo un vector [0] de un elemento). Los nodos volvian
+    // asi SIN vector, y con ellos cualquier calculo posterior sobre el resultado
+    // (RERANK por coseno, la diversidad de MMR) operaba sobre ceros. Casteado a
+    // texto vuelve como '[0.1,0.2,...]', que es justo lo que espera el parser.
+    SQL.AppendLine('SELECT id, entidad, content, model, properties, embedding::text AS embedding, final_score');
     SQL.AppendLine('FROM final_scored');
     if APrecision > 0 then
       SQL.AppendLine('WHERE final_score >= ' + FloatToStr(APrecision, FS));

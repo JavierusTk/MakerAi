@@ -5,14 +5,14 @@
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
-// o use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
 //
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
 //
-// HE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
@@ -255,6 +255,7 @@ Var
   I: Integer;
 begin
   Result := TStringList.Create;
+  try // ISSUE #114: si el cuerpo lanza, liberar Result para no fugarlo
 
   If aUrl <> '' then
     EndPointUrl := aUrl
@@ -262,7 +263,7 @@ begin
     EndPointUrl := GlAIUrl;
 
   Client := TNetHTTPClient.Create(Nil);
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 34}
   Client.SynchronizeEvents := False;
 {$ENDIF}
   Response := TStringStream.Create('', TEncoding.UTF8);
@@ -273,6 +274,9 @@ begin
     Client.ContentType := 'application/json';
 
     Res := Client.Get(sUrl, Response, Headers);
+
+    if not Assigned(Res) then
+      raise Exception.CreateFmt('Connection failed: no response from %s', [sUrl]);
 
     if Res.StatusCode = 200 then
     Begin
@@ -314,6 +318,10 @@ begin
     Client.Free;
     Response.Free;
   End;
+  except // ISSUE #114: el camino de error no debe dejar huerfano el Result
+    Result.Free;
+    raise;
+  end;
 end;
 
 function TAiOllamaChat.InitChatCompletions: String;
@@ -357,26 +365,13 @@ begin
     // 1. Structured Outputs (JSON Schema)
     if FResponse_format = tiaChatRfJsonSchema then
     begin
-      if JsonSchema.Text <> '' then
-      begin
-        try
-          // Ollama espera el esquema DIRECTAMENTE en el parámetro "format".
-          // No requiere wrappers como "json_schema" o "schema".
-          Var sShema := StringReplace(JsonSchema.Text,'\n',' ',[rfReplaceAll]);
-          var
-          JSchema := TJSonObject.ParseJSONValue(sShema);
-
-          if Assigned(JSchema) then
-          begin
-            if JSchema is TJSonObject then
-              AJSONObject.AddPair('format', JSchema as TJSonObject)
-            else
-              JSchema.Free; // Si no es un objeto válido, limpiar
-          end;
-        except
-          // Manejo silencioso de errores de parseo, se enviará sin formato o ignorado
-        end;
-      end;
+      // Ollama espera el esquema DIRECTAMENTE en el parámetro "format" (sin
+      // wrappers). ParseJsonSchemaProperty extrae el schema interno si el usuario
+      // paso el wrapper {name, strict, schema} y falla con error claro si esta vacio.
+      var sSchemaName := '';
+      var bStrict := False;
+      var JInnerSchema := ParseJsonSchemaProperty(sSchemaName, bStrict);
+      AJSONObject.AddPair('format', JInnerSchema);
     end
     // 2. JSON Mode (Simple)
     else if (FResponse_format = tiaChatRfJson) then
@@ -469,7 +464,13 @@ begin
 
   DoStateChange(acsConnecting, 'Sending request...');
 
-  St := TStringStream.Create('', TEncoding.UTF8);
+  // ISSUE #100: usar FCurrentPostStream (no un St local) para que el stream del POST
+  // sobreviva en async y se libere de forma segura en OnRequestCompletedEvent (base),
+  // en vez de fugarse (el código previo nunca liberaba St en async).
+  if Assigned(FCurrentPostStream) then
+    FreeAndNil(FCurrentPostStream);
+  FCurrentPostStream := TStringStream.Create('', TEncoding.UTF8);
+  St := FCurrentPostStream;
   sUrl := Url + 'api/chat';
 
   Try
@@ -517,9 +518,10 @@ begin
       end;
     End;
   Finally
+    // Sync: liberar aquí (ya se consumió). Async: lo libera OnRequestCompletedEvent
+    // (base) cuando la petición completa, de forma segura (sin fuga ni use-after-free).
     If FClient.Asynchronous = False then
-      St.Free;
-    // Esto no funciona en multiarea, así que se libera cuando no lo es.
+      FreeAndNil(FCurrentPostStream);
   End;
 end;
 
@@ -637,6 +639,7 @@ begin
   if FAbort then
   begin
     FBusy := False;
+    FPendingToolRun := False;
     FTmpToolCallsStr := '';
     FAsyncResMsg := nil; // descartar ResMsg pendiente al abortar
     if Assigned(FOnReceiveDataEnd) then
@@ -646,7 +649,15 @@ begin
 
   try
     // 1. Acumular el nuevo chunk de datos
-    LChunkStr := FResponse.DataString;
+    // ISSUE #124: si el chunk termina en un caracter UTF-8 incompleto, DataString
+    // lanza EEncodingError; se sale sin hacer Clear y el proximo chunk lo completa
+    // (dejarlo caer al except general abortaria el turno con DoError).
+    try
+      LChunkStr := FResponse.DataString;
+    except
+      on EEncodingError do
+        Exit;
+    end;
     FResponse.Clear;
     FTmpResponseText := FTmpResponseText + LChunkStr;
     LStreamFinished := False;
@@ -727,6 +738,7 @@ begin
     on E: Exception do
     begin
       FBusy := False;
+      FPendingToolRun := False;
       DoError('Error en OnInternalReceiveData (Ollama Stream): ' + E.Message, E);
     end;
   end;
@@ -793,15 +805,14 @@ begin
 
   // Sincronizar el contenido acumulado durante el streaming (FLastContent) con el ResMsg
   if (FLastContent <> '') then
-    ResMsg.Content := FLastContent
+    ResMsg.Prompt := FLastContent
   else
   begin
-    ResMsg.Content := LContent;
+    ResMsg.Prompt := LContent;
     FLastContent := LContent;
   end;
 
   // Configurar propiedades del mensaje de respuesta
-  ResMsg.Prompt := ResMsg.Content;
   ResMsg.Role := LRole;
   ResMsg.Model := LModel;
   ResMsg.ReasoningContent := LReasoning;
@@ -822,7 +833,7 @@ begin
     // --- CASO A: El modelo solicita ejecutar herramientas ---
 
     // A.1 Guardamos el mensaje del asistente (la petición de tool) en el historial
-    LHistoryToolMsg := TAiChatMessage.Create(ResMsg.Content, LRole);
+    LHistoryToolMsg := TAiChatMessage.Create(ResMsg.Prompt, LRole);
     LHistoryToolMsg.Tool_calls := LToolCallsArray.ToJSON;
     LHistoryToolMsg.Id := FMessages.Count + 1;
     FMessages.Add(LHistoryToolMsg);
@@ -874,8 +885,18 @@ begin
           Inc(I);
         end;
 
-        // Esperar a que todas las funciones terminen (bloqueo controlado)
-        TTask.WaitForAll(TaskList);
+        // Esperar a que todas las funciones terminen (bloqueo controlado).
+        // Bombear Synchronize/Queue para no colgar la app si un tool call accede
+        // a la VCL/FMX via TThread.Synchronize (issue #103).
+        // OJO: CheckSynchronize SOLO es valido en el hilo principal; en hilos
+        // secundarios (workers Indy de un servicio headless, TTask de agentes)
+        // LANZA excepcion "CheckSynchronize called from thread X". Fuera del main
+        // thread solo esperamos. Mismo criterio que TMCPClientSSE.WaitForInitialization.
+        while not TTask.WaitForAll(TaskList, 10) do
+          if TThread.CurrentThread.ThreadID = MainThreadID then
+            CheckSynchronize(0)
+          else
+            TThread.Sleep(10);
 
         // A.4 Añadir los resultados de las funciones (role: tool) al historial
         for LToolCall in LFunciones.Values do
@@ -890,14 +911,21 @@ begin
 
         // A.5 Re-ejecutar el Run para que el modelo analice los resultados de las herramientas
         // Limpiamos el ResMsg para recibir la respuesta final
-        ResMsg.Content := '';
+        ResMsg.Prompt := '';
         ResMsg.Tool_calls := '';
         FLastContent := '';
         // En modo async, preservar ResMsg entre rounds para que ProcessFinalJsonObject
         // lo reutilice y conserve los MediaFiles agregados durante tool calls.
+        // ISSUE #100: NO reentrar al THTTPClient desde su callback de recepción (este
+        // ParseChat corre dentro de OnInternalReceiveData). Se difiere la continuación a
+        // OnRequestCompletedEvent (base). En sync se reentra directo (seguro).
         if Self.Asynchronous then
+        begin
           FAsyncResMsg := ResMsg;
-        Self.Run(nil, ResMsg);
+          FPendingToolRun := True;
+        end
+        else
+          Self.Run(nil, ResMsg);
       end;
     finally
       LChoicesSimulado.Free;
@@ -910,11 +938,11 @@ begin
     // --- CASO B: Respuesta de texto normal o final de cadena ---
 
     // B.1 Extracción automática de bloques de código si se solicita
-    if (cap_ExtractCode in SessionCaps) and (ResMsg.Content <> '') then
+    if (cap_ExtractCode in SessionCaps) and (ResMsg.Prompt <> '') then
     begin
       Code := TMarkdownCodeExtractor.Create;
       try
-        CodeFiles := Code.ExtractCodeFiles(ResMsg.Content);
+        CodeFiles := Code.ExtractCodeFiles(ResMsg.Prompt);
         for CodeFile in CodeFiles do
         begin
           St := TStringStream.Create(CodeFile.Code, TEncoding.UTF8);

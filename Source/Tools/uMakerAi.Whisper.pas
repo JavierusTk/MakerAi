@@ -1,18 +1,18 @@
-﻿// IT License
+﻿// MIT License
 //
 // Copyright (c) <year> <copyright holders>
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
-// o use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
 //
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
 //
-// HE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
@@ -36,6 +36,12 @@
 // Whisper mantiene la compatibilidad con la versi?n de Github de whisper opensource
 // el modelo estandar de OpenAi se mueva a uMakerAi.OpenAi.Audio con las nuevas
 // caracteristicas.
+//
+// En la API de OpenAI, whisper-1 esta DEPRECADO (2026-08-26, apagado
+// 2027-02-26) y tts-1 / tts-1-hd tambien (2026-10-01, apagado 2027-01-06).
+// Contra api.openai.com usar Model := 'gpt-transcribe' (solo json, sin
+// timestamps ni srt/vtt). Contra un servidor whisper propio (Url) los
+// defaults siguen siendo validos y por eso no se cambian.
 
 unit uMakerAi.Whisper;
 
@@ -371,7 +377,7 @@ begin
   /// PCM: Similar to WAV but containing the raw samples in 24kHz (16-bit signed, low-endian), without the header.
 
   Client := TNetHTTPClient.Create(Nil);
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 34}
   Client.SynchronizeEvents := False;
 {$ENDIF}
   St := TStringStream.Create('', TEncoding.UTF8);
@@ -451,7 +457,7 @@ begin
   sUrl := FUrl + 'audio/transcriptions';
 
   Client := TNetHTTPClient.Create(Nil);
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 34}
   Client.SynchronizeEvents := False;
 {$ENDIF}
   Headers := [TNetHeader.Create('Authorization', 'Bearer ' + ApiKey)];
@@ -526,7 +532,7 @@ begin
   sUrl := FUrl + 'audio/translations';
 
   Client := TNetHTTPClient.Create(Nil);
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 34}
   Client.SynchronizeEvents := False;
 {$ENDIF}
   Headers := [TNetHeader.Create('Authorization', 'Bearer ' + FApiKey)];

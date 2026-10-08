@@ -70,7 +70,7 @@ Type
     cap_Pdf,              // modelo entiende PDFs entrantes
     cap_WebSearch,        // modelo puede buscar en la web
     cap_Reasoning,        // modelo tiene razonamiento extendido (CoT)
-    cap_CodeInterpreter,  // modelo puede ejecutar c�digo
+    cap_CodeInterpreter,  // modelo puede ejecutar código
     cap_Memory,           // modelo tiene memoria persistente
     cap_TextEditor,       // modelo puede editar archivos
     cap_ComputerUse,      // modelo puede controlar el ordenador
@@ -87,7 +87,15 @@ Type
   // Tipo de evento para manejar errores
   TAiErrorEvent = procedure(Sender: TObject; const ErrorMsg: string; Exception: Exception; const AResponse: IHTTPResponse) of object;
 
-  TAiThinkingLevel = (tlDefault, tlLow, tlMedium, tlHigh); // Default es medium en la mayor?a de los casos
+  // Los cuatro primeros son los historicos y NO se reordenan: hay codigo que
+  // compara contra tlDefault y persistencia que guarda el ordinal.
+  // Los cuatro de la cola llegaron con la escalera completa de OpenAI
+  // (none < minimal < low < medium < high < xhigh < max). gpt-6-astra acepta
+  // de low a max y devuelve 400 ante 'none'.
+  // Cada driver CLAMPA lo que su proveedor no conoce (xhigh/max -> su tope,
+  // minimal -> su minimo): un mismo reasoning_effort tiene que sobrevivir al
+  // fallback a otro proveedor sin romper la peticion.
+  TAiThinkingLevel = (tlDefault, tlLow, tlMedium, tlHigh, tlNone, tlMinimal, tlXHigh, tlMax); // Default es medium en la mayor?a de los casos
   TAiMediaResolution = (mrDefault, mrLow, mrMedium, mrHigh);
 
   // Se utiliza especialmente en OpenAi en la transcripci?n
@@ -280,6 +288,12 @@ function StreamToBase64(Stream: TMemoryStream): String;
 // convierte una lista de valores Key1=Value1  en una lista de parametros de query de una URL
 function GetParametrosURL(Parametros: TStringList): string;
 
+// Vocabulario canonico de reasoning effort. Devuelve False si la cadena no es
+// uno de los siete niveles conocidos, para que quien lo reciba pueda
+// rechazarla en vez de tragarsela y aplicar el default en silencio.
+function StrToThinkingLevel(const S: String; out ALevel: TAiThinkingLevel): Boolean;
+function ThinkingLevelToStr(ALevel: TAiThinkingLevel): String;
+
 implementation
 
 uses
@@ -290,6 +304,39 @@ uses
   ;
 {$REGION 'Utilidades varias' }
 {$I uMakerAi.Version.inc}
+
+function StrToThinkingLevel(const S: String; out ALevel: TAiThinkingLevel): Boolean;
+var
+  V: String;
+begin
+  ALevel := tlDefault;
+  V := LowerCase(Trim(S));
+  Result := True;
+  if V = '' then Exit;         // vacio = default del driver, no es un error
+  if V = 'none' then ALevel := tlNone
+  else if V = 'minimal' then ALevel := tlMinimal
+  else if V = 'low' then ALevel := tlLow
+  else if V = 'medium' then ALevel := tlMedium
+  else if V = 'high' then ALevel := tlHigh
+  else if V = 'xhigh' then ALevel := tlXHigh
+  else if V = 'max' then ALevel := tlMax
+  else Result := False;
+end;
+
+function ThinkingLevelToStr(ALevel: TAiThinkingLevel): String;
+begin
+  case ALevel of
+    tlNone:    Result := 'none';
+    tlMinimal: Result := 'minimal';
+    tlLow:     Result := 'low';
+    tlMedium:  Result := 'medium';
+    tlHigh:    Result := 'high';
+    tlXHigh:   Result := 'xhigh';
+    tlMax:     Result := 'max';
+  else
+    Result := '';             // tlDefault
+  end;
+end;
 
 function GetParametrosURL(Parametros: TStringList): string;
 var
@@ -572,6 +619,10 @@ begin
   else if SameText(MimeType, 'audio/ogg') then
     Result := 'ogg'
   else if SameText(MimeType, 'audio/wav') then
+    Result := 'wav'
+  else if SameText(MimeType, 'audio/x-wav') then
+    Result := 'wav'
+  else if SameText(MimeType, 'audio/wave') then
     Result := 'wav'
   else if SameText(MimeType, 'audio/flac') then
     Result := 'flac'

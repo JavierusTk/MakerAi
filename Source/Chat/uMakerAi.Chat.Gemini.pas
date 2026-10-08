@@ -1,18 +1,18 @@
-﻿// IT License
+﻿// MIT License
 //
 // Copyright (c) <year> <copyright holders>
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
-// o use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
 //
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
 //
-// HE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
@@ -151,6 +151,38 @@ begin
   RegisterComponents('MakerAI', [TAiGeminiChat]);
 end;
 
+// Versión numérica de un id 'gemini-X[.Y]-...' ('gemini-3.8-flash' -> 3.8,
+// 'gemini-3-flash-preview' -> 3.0). 0 si el nombre no sigue ese patrón
+// (alias como 'gemini-flash-latest', modelos omni, etc.).
+function GeminiModelVersion(const AModel: string): Double;
+var
+  S, Num: string;
+  I, Dots: Integer;
+begin
+  Result := 0;
+  S := AModel.ToLower;
+  if not S.StartsWith('gemini-') then
+    Exit;
+  Num := '';
+  Dots := 0;
+  for I := Length('gemini-') + 1 to Length(S) do
+  begin
+    if CharInSet(S[I], ['0'..'9']) then
+      Num := Num + S[I]
+    else if (S[I] = '.') and (Dots = 0) and (Num <> '') then
+    begin
+      Num := Num + '.';
+      Inc(Dots);
+    end
+    else
+      Break;
+  end;
+  if Num.EndsWith('.') then
+    Delete(Num, Length(Num), 1);
+  if Num <> '' then
+    Result := StrToFloatDef(Num, 0, TFormatSettings.Invariant);
+end;
+
 { TAiGeminiChat }
 
 class function TAiGeminiChat.GetDriverName: string;
@@ -162,8 +194,10 @@ class procedure TAiGeminiChat.RegisterDefaultParams(Params: TStrings);
 Begin
   Params.Clear;
   Params.Add('ApiKey=@GEMINI_API_KEY');
-  // [V3 UPDATE] Modelo recomendado por defecto actualizado (gemini-2.0-flash deprecado 31 Mar 2026)
-  Params.Add('Model=gemini-2.5-flash');
+  // Default: gemini-3.8-flash (estable, sep 2026). La familia 2.5 sigue viva
+  // pero Google la limita a cuentas que ya la usaban: para un usuario nuevo
+  // un default 2.5 fallaba. Registrado sin prueba runtime (sin API key).
+  Params.Add('Model=gemini-3.8-flash');
   Params.Add('Max_Tokens=8192');
   Params.Add('URL=' + GlAIUrl);
 End;
@@ -248,7 +282,7 @@ constructor TAiGeminiChat.Create(Sender: TComponent);
 begin
   inherited;
   ApiKey := '@GEMINI_API_KEY';
-  Model := 'gemini-2.5-flash';
+  Model := 'gemini-3.8-flash';
   Url := GlAIUrl;
 
   // [V3 UPDATE] Gemini 3 recomienda Temperature 1.0 por defecto para razonamiento
@@ -1076,23 +1110,22 @@ begin
     // D. Computer Use
     if (cap_ComputerUse in ModelConfig.ModelCaps) then
     Begin
-      // En Gemini 2.5, Computer Use es una herramienta de primer nivel,
-      // al igual que 'googleSearch' o 'codeExecution'.
+      // En Gemini, Computer Use es una herramienta de primer nivel,
+      // al igual que 'googleSearch' o 'codeExecution'. El campo va en camelCase
+      // ('computerUse') igual que el resto de tools nativos del REST de Gemini.
       var
       JComputerTool := TJSONObject.Create;
       var
       JCompSettings := TJSONObject.Create;
 
-      // La documentación especifica el entorno.
-      // Valores posibles suelen ser 'BROWSER' o 'ENVIRONMENT_BROWSER'.
-      // Usaremos 'only_name' si la API lo infiere, pero mejor ser explícitos.
-      // Si falla con 400, probaremos quitando el par 'environment'.
-      // JCompSettings.AddPair('environment', 'BROWSER');
+      // 'environment' es requerido. ENVIRONMENT_BROWSER es el entorno de
+      // automatización web (gemini-2.5-computer-use-preview / gemini-3-flash).
+      JCompSettings.AddPair('environment', 'ENVIRONMENT_BROWSER');
 
-      // Nota: Si quieres excluir acciones (como drag_and_drop), se configuran aquí.
-      // Por ahora enviamos el objeto vacío o con configuración mínima si es necesario.
+      // Para excluir acciones (p.ej. drag_and_drop) se usaría aquí
+      // 'excludedPredefinedFunctions': [...].
 
-      JComputerTool.AddPair('computer_use', JCompSettings);
+      JComputerTool.AddPair('computerUse', JCompSettings);
 
       JArrTools.Add(JComputerTool);
     End;
@@ -1110,10 +1143,22 @@ begin
     LRequest.AddPair('generationConfig', JConfig);
 
     // A. Parámetros Estándar (No perder funcionalidad básica)
-    if Temperature >= 0 then
+    // Sampling params (temperature/topP/topK) DEPRECADOS por Google para la
+    // familia 3.5 en adelante y omni (jul 21/2026): no se envían en esos modelos
+    // y el servidor gestiona el muestreo. En modelos previos se conservan.
+    // Se compara la versión (no una lista de nombres) para que 3.7, 3.8 y los
+    // que vengan queden cubiertos sin tocar el driver.
+    var LSamplingModel := TAiChatFactory.Instance.GetBaseModel(GetDriverName, Model);
+    var LSamplingOk := not ((GeminiModelVersion(LSamplingModel) >= 3.5) or
+                            LSamplingModel.StartsWith('gemini-omni') or
+                            LSamplingModel.StartsWith('gemini-flash-latest'));
+
+    if LSamplingOk and (Temperature >= 0) then
       JConfig.AddPair('temperature', TJSONNumber.Create(Temperature));
 
-    if Top_p >= 0 then
+    // 0 = no enviar topP (convención de SetTop_p en la base); topP:0 literal
+    // forzaría muestreo casi greedy en lugar del default del servidor.
+    if LSamplingOk and (Top_p > 0) then
       JConfig.AddPair('topP', TJSONNumber.Create(Top_p));
 
     if Max_tokens > 0 then
@@ -1177,15 +1222,18 @@ begin
       var
       JThinking := TJSONObject.Create;
       var
-        LModelName := Model.ToLower;
+        LModelName := TAiChatFactory.Instance.GetBaseModel(GetDriverName, Model).ToLower;
 
-      // Gemini 3: usar thinkingLevel string nativo (LOW/MEDIUM/HIGH)
+      // Gemini 3: usar thinkingLevel string nativo (LOW/MEDIUM/HIGH).
+      // El API no permite apagar el razonamiento y 'minimal' da error en
+      // 3.7/3.8, así que los niveles de la escalera ampliada (v3.8) se llevan
+      // al más cercano que el modelo acepta.
       if LModelName.Contains('gemini-3') then
       begin
         case ModelConfig.ThinkingLevel of
-          tlLow:    JThinking.AddPair('thinkingLevel', 'LOW');
-          tlMedium: JThinking.AddPair('thinkingLevel', 'MEDIUM');
-          tlHigh:   JThinking.AddPair('thinkingLevel', 'HIGH');
+          tlLow, tlMinimal, tlNone: JThinking.AddPair('thinkingLevel', 'LOW');
+          tlMedium:                 JThinking.AddPair('thinkingLevel', 'MEDIUM');
+          tlHigh, tlXHigh, tlMax:   JThinking.AddPair('thinkingLevel', 'HIGH');
         else
           JThinking.AddPair('thinkingLevel', 'HIGH'); // Default para Gemini 3
         end;
@@ -1299,6 +1347,9 @@ begin
     FTmpResponseText := '';
 
     Res := FClient.Post(sUrl, St, FResponse);
+
+    if not Assigned(Res) then
+      raise Exception.CreateFmt('Connection failed: no response from %s', [sUrl]);
 
     if FClient.Asynchronous = False then
     begin
@@ -1559,11 +1610,17 @@ begin
     // Procesar audio, links, etc.
     DoProcessResponse(AskMsg, ResMsg, LRespuesta);
 
-    // Eventos Finales
-    DoStateChange(acsFinished, 'Done');
+    // Eventos Finales.
+    // ISSUE #99 (defensivo): en async el evento final lo dispara OnInternalReceiveData,
+    // no ParseChat (que en Gemini solo corre en modo síncrono). El guard evita un doble
+    // disparo si alguna ruta async llegara a invocar ParseChat.
+    if not FClient.Asynchronous then
+    begin
+      DoStateChange(acsFinished, 'Done');
 
-    If Assigned(FOnReceiveDataEnd) then
-      FOnReceiveDataEnd(Self, ResMsg, jObj, LRole, LRespuesta);
+      If Assigned(FOnReceiveDataEnd) then
+        FOnReceiveDataEnd(Self, ResMsg, jObj, LRole, LRespuesta);
+    end;
   End
   // -------------------------------------------------------------------------
   // CASO 2: HAY FUNCIONES (EJECUCIÓN DE HERRAMIENTAS)
@@ -1657,7 +1714,17 @@ begin
         _CreateTask(ToolCall, I); // subrutina local garantiza captura por valor
         Inc(I);
       End;
-      TTask.WaitForAll(TaskList);
+      // Bombear Synchronize/Queue mientras se espera, para no colgar la app si un
+      // tool call accede a la VCL/FMX via TThread.Synchronize (issue #103).
+      // OJO: CheckSynchronize SOLO es valido en el hilo principal; en hilos
+      // secundarios (workers Indy de un servicio headless, TTask de agentes)
+      // LANZA excepcion "CheckSynchronize called from thread X". Fuera del main
+      // thread solo esperamos. Mismo criterio que TMCPClientSSE.WaitForInitialization.
+      while not TTask.WaitForAll(TaskList, 10) do
+        if TThread.CurrentThread.ThreadID = MainThreadID then
+          CheckSynchronize(0)
+        else
+          TThread.Sleep(10);
 
       // Crear los mensajes de respuesta de las herramientas
       For Clave in LFunciones.Keys do
@@ -2122,7 +2189,7 @@ var
 begin
   Result := '';
   LHttpClient := TNetHTTPClient.Create(Nil);
-{$IF CompilerVersion >= 35}
+{$IF CompilerVersion >= 34}
   LHttpClient.SynchronizeEvents := False;
 {$ENDIF}
   try
@@ -2244,8 +2311,8 @@ begin
   if (cap_ComputerUse in ModelConfig.ModelCaps) and Assigned(ChatTools.ComputerUseTool) then
   begin
     // Lista de acciones conocidas de Gemini 2.5
-    if MatchStr(LowerCase(ToolCall.Name), ['click_at', 'left_click', 'right_click', 'middle_click', 'double_click', 'type_text_at', 'type', 'key_combination', 'scroll_at', 'scroll_document', 'drag_and_drop', 'hover_at', 'mouse_move',
-      'navigate', 'search', 'open_web_browser', 'screenshot', 'wait_5_seconds', 'image_edit_at', 'draw_box_at']) then
+    if MatchStr(LowerCase(ToolCall.Name), ['click_at', 'left_click', 'right_click', 'middle_click', 'double_click', 'triple_click', 'type_text_at', 'type', 'key_combination', 'hold_key', 'scroll_at', 'scroll_document', 'drag_and_drop', 'hover_at', 'mouse_move',
+      'cursor_position', 'zoom', 'navigate', 'search', 'open_web_browser', 'go_back', 'go_forward', 'screenshot', 'wait_5_seconds']) then
     begin
       IsComputerAction := True;
     end;
@@ -2253,7 +2320,18 @@ begin
 
   if IsComputerAction then
   begin
-    // 2. Delegar al componente ComputerTool
+    // 2. Oportunidad de interceptar ANTES de ejecutar en local. Es el mismo
+    //    contrato que Claude, OpenAI y el bridge generico de TAiChat: si el
+    //    handler llena Response, la accion se da por ejecutada en otro sitio
+    //    (p.ej. un broker que reenvia el tool_call a su cliente) y aqui no se
+    //    toca la pantalla ni se captura nada.
+    if Assigned(FOnCallToolFunction) then
+      FOnCallToolFunction(Self, ToolCall);
+
+    if ToolCall.Response <> '' then
+      Exit;
+
+    // 3. Delegar al componente ComputerTool
     // Nota: ProcessToolCall es thread-safe siempre que tus eventos lo sean.
     // Como estamos dentro de un TTask (hilo), el evento OnExecuteAction se disparará en un hilo secundario.
     // Asegúrate de usar TThread.Synchronize en tu formulario si tocas la GUI.
@@ -2265,7 +2343,7 @@ begin
       // Asignar la respuesta JSON
       ToolCall.Response := ResponseJson;
 
-      // 3. Guardar la captura en el buffer temporal (Thread-Safe Lock)
+      // 4. Guardar la captura en el buffer temporal (Thread-Safe Lock)
       if Assigned(Screenshot) then
       begin
         TMonitor.Enter(FPendingScreenshots);
@@ -2287,9 +2365,12 @@ begin
   end
   else
   begin
-    // 4. Si no es acción de computadora, usar el comportamiento estándar (AiFunctions o Evento)
-    ToolCall.Response := 'Command '+ToolCall.name+' not found';
-    //inherited DoCallFunction(ToolCall);
+    // 5. Si no es acción de computadora, usar el comportamiento estándar:
+    //    bridge generico de ComputerUse, AiFunctions y, en ultima instancia,
+    //    OnCallToolFunction. Antes se respondia 'Command X not found' sin
+    //    llamar a inherited, asi que NINGUNA funcion de usuario llegaba a
+    //    ejecutarse a traves de este driver.
+    inherited DoCallFunction(ToolCall);
   end;
 end;
 
@@ -2655,8 +2736,8 @@ begin
 
                         ResMsg.MediaFiles.Add(NewVideoFile);
 
-                        ResMsg.Content := 'Video generado exitosamente.';
-                        FLastContent := ResMsg.Content;
+                        ResMsg.Prompt := 'Video generado exitosamente.';
+                        FLastContent := ResMsg.Prompt;
                       end);
                   end
                   else
@@ -3208,12 +3289,43 @@ Var
   LFunction: TAiToolsFunction;
   LName, LArgsStr: String;
   LModelVersion: String;
+
+  // Crea e inicia la task de una tool capturando TC por VALOR (param), seguro en D10.4+.
+  function _GemMakeToolTask(TC: TAiToolsFunction): ITask;
+  begin
+    Result := TTask.Create(
+      procedure
+      begin
+        try
+          DoCallFunction(TC);
+        except
+          on E: Exception do
+          begin
+            TC.Response := '{"error": "' + StringReplace(E.Message, '"', '''', [rfReplaceAll]) + '"}';
+            TThread.Queue(nil,
+              procedure
+              begin
+                DoError('Error Tool: ' + TC.Name, E);
+              end);
+          end;
+        end;
+      end);
+    Result.Start;
+  end;
+
 begin
   if (not FClient.Asynchronous) or AAbort then
     Exit;
 
   LogDebug('--OnInternalReceiveData--');
-  LogDebug(FResponse.DataString);
+  // ISSUE #124: el log no debe abortar el stream si el chunk termina en un
+  // caracter UTF-8 incompleto (ver lectura protegida mas abajo).
+  try
+    LogDebug(FResponse.DataString);
+  except
+    on EEncodingError do
+      LogDebug('[chunk UTF-8 parcial - log omitido]');
+  end;
 
   // 1. LECTURA DEL STREAM Y ACUMULACIÓN EN BUFFER
   if FResponse.Size > 0 then
@@ -3221,7 +3333,14 @@ begin
     FResponse.Position := 0;
     SetLength(BytesBuffer, FResponse.Size);
     FResponse.ReadBuffer(BytesBuffer[0], FResponse.Size);
-    S := TEncoding.UTF8.GetString(BytesBuffer);
+    // ISSUE #124: si el chunk termina en un caracter UTF-8 incompleto, GetString
+    // lanza EEncodingError: se sale sin vaciar FResponse y el proximo chunk lo completa.
+    try
+      S := TEncoding.UTF8.GetString(BytesBuffer);
+    except
+      on EEncodingError do
+        Exit;
+    end;
     FTmpResponseText := FTmpResponseText + S;
     FResponse.Size := 0;
     FResponse.Position := 0;
@@ -3526,80 +3645,55 @@ begin
           if Assigned(FOnAddMessage) then
             FOnAddMessage(Self, ResMsg, nil, ResMsg.Role, '');
 
-          // Ejecutar Tools en Tarea separada
-          TTask.Run(
-            procedure
-            var
-              LocalFuncs: TAiToolsFunctions;
-              LocalTasks: array of ITask;
-              LocalFn: TAiToolsFunction;
-              TaskIdx: Integer;
-            // Subrutina local: garantiza captura independiente por valor en Delphi 10.4+
-            procedure _CreateLocalTask(TC: TAiToolsFunction; AIdx: Integer);
-            begin
-              LocalTasks[AIdx] := TTask.Create(
-                procedure
-                begin
-                  try
-                    DoCallFunction(TC);
-                  except
-                    on E: Exception do
-                    begin
-                      TC.Response := '{"error": "' + StringReplace(E.Message, '"', '''', [rfReplaceAll]) + '"}';
-                      TThread.Queue(nil,
-                        procedure
-                        begin
-                          DoError('Error Tool: ' + TC.Name, E);
-                        end);
-                    end;
-                  end;
-                end);
-              LocalTasks[AIdx].Start;
-            end;
-            begin
-              LocalFuncs := LFunciones;
-              try
-                SetLength(LocalTasks, LocalFuncs.Count);
-                TaskIdx := 0;
-                for var LocalKey in LocalFuncs.Keys do
-                begin
-                  LocalFn := LocalFuncs[LocalKey];
-                  LocalFn.ResMsg := ResMsg;
-                  LocalFn.AskMsg := AskMsg;
+          // ISSUE #100: ejecutar las tools de forma SÍNCRONA aquí (como Cohere/Ollama/base
+          // con WaitForAll) en vez del TTask.Run asíncrono previo. Ese TTask desacoplaba la
+          // ejecución de tools del ciclo HTTP y, junto con el AAbort temprano, obligaba a un
+          // rendezvous frágil + reentraba Self.Run liberando el FCurrentPostStream en vuelo
+          // (AV). Al ejecutarlas síncronas, terminan ANTES del cierre de la petición, así que
+          // basta marcar FPendingToolRun: la continuación la lanza OnRequestCompletedEvent
+          // (base) cuando el stream ya se liberó de forma segura. La doc oficial confirma que
+          // el stream cierra solo tras finishReason=STOP (sin [DONE]).
+          // D11 compat: inline var no acepta tipos anonimos "array of T" (E2029 en 11.x);
+          // TArray<ITask> es tipo nombrado y compila desde D11 en adelante.
+          var LLocalTasks: TArray<ITask>;
+          SetLength(LLocalTasks, LFunciones.Count);
+          var LTaskIdx := 0;
+          for var LLocalKey in LFunciones.Keys do
+          begin
+            LFunction := LFunciones[LLocalKey];
+            LFunction.ResMsg := ResMsg;
+            LFunction.AskMsg := AskMsg;
+            LLocalTasks[LTaskIdx] := _GemMakeToolTask(LFunction); // captura por valor
+            Inc(LTaskIdx);
+          end;
 
-                  _CreateLocalTask(LocalFn, TaskIdx); // subrutina local garantiza captura por valor
-                  Inc(TaskIdx);
-                end;
+          // Bombear Synchronize/Queue mientras se espera, para no colgar la app si un
+          // tool call accede a la VCL/FMX via TThread.Synchronize (issue #103).
+          // OJO: CheckSynchronize SOLO es valido en el hilo principal; en hilos
+          // secundarios (workers Indy de un servicio headless, TTask de agentes)
+          // LANZA excepcion "CheckSynchronize called from thread X". Fuera del main
+          // thread solo esperamos. Mismo criterio que TMCPClientSSE.WaitForInitialization.
+          while not TTask.WaitForAll(LLocalTasks, 10) do
+            if TThread.CurrentThread.ThreadID = MainThreadID then
+              CheckSynchronize(0)
+            else
+              TThread.Sleep(10);
 
-                TTask.WaitForAll(LocalTasks);
+          for var LLocalKey in LFunciones.Keys do
+          begin
+            LFunction := LFunciones[LLocalKey];
+            var ToolMsg := TAiChatMessage.Create(LFunction.Response, 'tool', LFunction.Id, LFunction.Name);
+            for var LMF in LFunction.MediaFiles do
+              ToolMsg.AddMediaFile(LMF);
+            LFunction.MediaFiles.OwnsObjects := False;
+            ToolMsg.Id := FMessages.Count + 1;
+            FMessages.Add(ToolMsg);
+          end;
 
-                TThread.Synchronize(nil,
-                  procedure
-                  begin
-                    for var LocalKey in LocalFuncs.Keys do
-                    begin
-                      LocalFn := LocalFuncs[LocalKey];
-                      var
-                      ToolMsg := TAiChatMessage.Create(LocalFn.Response, 'tool', LocalFn.Id, LocalFn.Name);
-                      for var LMF in LocalFn.MediaFiles do
-                        ToolMsg.AddMediaFile(LMF);
-                      LocalFn.MediaFiles.OwnsObjects := False;
-                      ToolMsg.Id := FMessages.Count + 1;
-                      FMessages.Add(ToolMsg);
-                    end;
-                  end);
+          LFunciones.Free;
 
-                // RECURSIÓN
-                TThread.Queue(nil,
-                  procedure
-                  begin
-                    Self.Run(nil, ResMsg);
-                  end);
-
-              finally
-                LocalFuncs.Free;
-              end;
-            end);
+          // Continuación diferida (segundo round) — la lanza OnRequestCompletedEvent base.
+          FPendingToolRun := True;
         end
         else
         begin
@@ -3618,8 +3712,15 @@ begin
             FOnReceiveDataEnd(Self, ResMsg, nil, 'model', FLastContent);
         end;
 
-        // FINALIZAR: Cortar conexión HTTP
-        AAbort := True;
+        // FINALIZAR.
+        // ISSUE #100: si hay continuación tool-calling diferida (FPendingToolRun), NO
+        // abortamos: dejamos que el stream cierre de forma natural tras finishReason=STOP
+        // (confirmado en la doc oficial de Gemini), para que dispare un OnRequestCompletedEvent
+        // LIMPIO (no un OnRequestError por abort) — es ese evento el que lanza el siguiente
+        // round y libera el FCurrentPostStream de forma segura. En el caso final (sin tools)
+        // sí cortamos la conexión.
+        if not FPendingToolRun then
+          AAbort := True;
         jObj.Free;
         Exit;
       end;
@@ -3632,15 +3733,16 @@ end;
 
 procedure TAiGeminiChat.OnRequestCompletedEvent(const Sender: TObject; const aResponse: IHTTPResponse);
 begin
-  // Si ya se procesó el final en el stream (finishReason detectado), FBusy será False.
-  if not FBusy then
-    Exit;
+  // Si el stream terminó HTTP-wise pero NO detectamos finishReason antes (FBusy sigue True),
+  // forzamos el cierre/finalización aquí.
+  if FBusy then
+    InternalCompleteRequest;
 
-  // Si llegamos aquí, el stream terminó HTTP-wise pero no detectamos finishReason antes.
-  // Forzamos el cierre.
-  InternalCompleteRequest;
-
-  // Llamamos al padre por si acaso tiene lógica genérica
+  // ISSUE #100: SIEMPRE delegar al base. Su OnRequestCompletedEvent libera el
+  // FCurrentPostStream de forma segura y, si quedó FPendingToolRun=True (continuación
+  // tool-calling diferida), lanza el siguiente round vía ForceQueue/Queue. Antes este
+  // método hacía 'if not FBusy then Exit' y se saltaba el inherited, dejando la
+  // continuación sin disparar.
   inherited OnRequestCompletedEvent(Sender, aResponse);
 end;
 
